@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "expense-tracker",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "expense_tracker/app.py", "--server.port", "8501"],
+      "port": 8501
+    }
+  ]
+}
