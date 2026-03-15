@@ -86,6 +86,8 @@ RULES = [
                                 "GETNOMAD", "PARKPLATZ", "PARKING",
                                 # Oman mountain resorts
                                 "ALAKHDER", "ALAKHDAR",
+                                # Hotel URLs that truncate before "SUITES"
+                                "DOWNTOWNSUI",    # https://www.downtownsuites...
                                 ]),
 
     ("Entertainment",          ["MUSCAT FESTIVAL", "CINEMA", "VOX", "REEL", "THEME PARK",
@@ -106,6 +108,7 @@ RULES = [
                                 "AL EZZ COLD STORE", "COLD STORE", "NAH&FRISCH",
                                 "EDEKA", "ALDI",
                                 "GEMISCHTWARENHANDEL",  # German general goods store
+                                "INVEST FRUI",    # fruit/produce traders (BUSINESS RFED INVEST FRUI)
                                 ]),
 
     ("Shopping & Retail",      ["AMERICAN EAGLE", "PIERRE CARDIN", "H&M", "ZARA", "MARKS",
@@ -125,6 +128,9 @@ RULES = [
                                 "AL WASHEEL",     # AL WASHEEL trading
                                 "NOOR SHOPPING",  # NOOR SHOPPING
                                 "TELE CENTER",    # M und M Tele Center
+                                "ALIF STORE",     # Alif Stores (Omani bookstore/stationery)
+                                "HAPPY CENTER",   # small general/retail store
+                                "AFAQ",           # Afaq trading (Oman retail)
                                 ]),
 
     ("Automotive",             ["AUTOPOWER", "CAR WASH", "TYRE", "AUTOCARE"]),
@@ -161,8 +167,16 @@ RULES = [
                                 "CANDY SHOP",     # sweet shop
                                 "AM ROTEN STAND", # German food stall
                                 "CHILL OUT",      # cafe/restaurant
+                                # Vending machines / small food outlets
+                                "DELIKOMAT",      # Czech vending machine
+                                "BADRALSAMAA",    # Omani food stall / small restaurant
+                                "FRIENDS",        # small cafe/restaurant
                                 ]),
 ]
+
+# ── Immaterial-Others threshold ───────────────────────────────────────────────
+# If total unclassified spend is BELOW this amount, suppress the warning banner.
+OTHERS_WARN_OMR = 150  # warn only if total unclassified spend exceeds this
 
 COLORS    = px.colors.qualitative.Pastel
 CHART_CFG = {"displayModeBar": True, "displaylogo": False,
@@ -539,11 +553,13 @@ with t_overview:
                       f"OMR {cat_totals.max():,.0f}  ({top_cat_pct:.0f}% of spend)")
             st.caption(f"In {cycle_label(latest_cycle)}")
 
-        # Others warning
-        n_others = int((flt["Category"] == "Others").sum())
-        if n_others > 0:
+        # Others warning — only shown when total unclassified spend is material
+        others_amt = flt[flt["Category"] == "Others"]["Amount"].sum()
+        n_others   = int((flt["Category"] == "Others").sum())
+        if others_amt > OTHERS_WARN_OMR:
             st.warning(
-                f"{n_others} transaction(s) unclassified ('Others') — fix in **Reclassify** tab."
+                f"OMR {others_amt:,.0f} unclassified across {n_others} transaction(s) — "
+                f"fix in **Reclassify** tab."
             )
 
         st.divider()
@@ -1237,18 +1253,41 @@ with t_reclassify:
         "Saved changes apply to all past and future transactions from that merchant."
     )
 
-    col_tog, col_reset = st.columns([3, 2])
-    show_others_only = col_tog.checkbox("Show only 'Others' merchants", value=True)
-    if col_reset.button("Reset all manual overrides", type="secondary"):
-        save_overrides({})
-        st.success("All manual overrides cleared.")
-        st.rerun()
-
     summary = (
         expenses.groupby(["Description", "Category"])["Amount"]
         .agg(Total="sum", Count="count").reset_index()
         .sort_values("Total", ascending=False)
     )
+
+    # ── Others summary banner ──────────────────────────────────────────────────
+    others_summary = summary[summary["Category"] == "Others"]
+    total_others_omr = others_summary["Total"].sum()
+    n_others_merch   = len(others_summary)
+    if n_others_merch > 0:
+        if total_others_omr <= OTHERS_WARN_OMR:
+            st.success(
+                f"✅ Others total is OMR {total_others_omr:,.0f} across "
+                f"{n_others_merch} merchant(s) — immaterial, no action needed."
+            )
+        else:
+            st.warning(
+                f"OMR {total_others_omr:,.0f} unclassified across "
+                f"{n_others_merch} merchant(s) — consider classifying below."
+            )
+    else:
+        st.success("✅ All merchants classified — nothing in Others.")
+
+    # ── Controls ───────────────────────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([3, 3, 2])
+    show_others_only = ctrl1.checkbox("Show only 'Others' merchants", value=True)
+    min_omr = ctrl2.slider(
+        "Hide items below OMR", min_value=0, max_value=50, value=5,
+        help="Others merchants below this total are hidden — they're immaterial",
+    )
+    if ctrl3.button("Reset all overrides", type="secondary"):
+        save_overrides({})
+        st.success("All manual overrides cleared.")
+        st.rerun()
 
     others_first = pd.concat([
         summary[summary["Category"] == "Others"],
@@ -1258,26 +1297,35 @@ with t_reclassify:
     if show_others_only:
         others_first = others_first[others_first["Category"] == "Others"]
 
-    pending = {}
-    for _, row in others_first.iterrows():
-        desc    = row["Description"]
-        current = overrides.get(desc, row["Category"])
-        c1, c2, c3 = st.columns([4, 3, 2])
-        c1.text(desc[:55])
-        sel = c2.selectbox(
-            "",
-            CATEGORIES,
-            index=CATEGORIES.index(current) if current in CATEGORIES else 0,
-            key=f"r_{desc}",
-            label_visibility="collapsed",
-        )
-        c3.caption(f"OMR {round(row['Total']):,}  ·  {int(row['Count'])} txns")
-        if sel != current:
-            pending[desc] = sel
+    # Apply the minimum-amount filter only to Others rows
+    others_first = others_first[
+        (others_first["Category"] != "Others") |
+        (others_first["Total"] >= min_omr)
+    ]
 
-    st.divider()
-    if st.button("Save Overrides", type="primary", disabled=not pending):
-        overrides.update(pending)
-        save_overrides(overrides)
-        st.success(f"Saved {len(pending)} override(s).")
-        st.rerun()
+    if others_first.empty:
+        st.info(f"No merchants to show (all Others items are below OMR {min_omr}).")
+    else:
+        pending = {}
+        for _, row in others_first.iterrows():
+            desc    = row["Description"]
+            current = overrides.get(desc, row["Category"])
+            c1, c2, c3 = st.columns([4, 3, 2])
+            c1.text(desc[:55])
+            sel = c2.selectbox(
+                "",
+                CATEGORIES,
+                index=CATEGORIES.index(current) if current in CATEGORIES else 0,
+                key=f"r_{desc}",
+                label_visibility="collapsed",
+            )
+            c3.caption(f"OMR {round(row['Total']):,}  ·  {int(row['Count'])} txns")
+            if sel != current:
+                pending[desc] = sel
+
+        st.divider()
+        if st.button("Save Overrides", type="primary", disabled=not pending):
+            overrides.update(pending)
+            save_overrides(overrides)
+            st.success(f"Saved {len(pending)} override(s).")
+            st.rerun()
