@@ -10,9 +10,10 @@ warnings.filterwarnings("ignore")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BASE_DIR  = Path(__file__).parent
-DATA_FILE = BASE_DIR / "expense_data.csv"
-OVR_FILE  = BASE_DIR / "category_overrides.json"
+BASE_DIR   = Path(__file__).parent
+DATA_FILE  = BASE_DIR / "expense_data.csv"
+DEMO_FILE  = BASE_DIR / "demo_data.csv"
+OVR_FILE   = BASE_DIR / "category_overrides.json"
 
 CATEGORIES = [
     "Groceries",
@@ -313,10 +314,13 @@ def save_overrides(overrides: dict):
     OVR_FILE.write_text(json.dumps(overrides, indent=2))
 
 
-def load_data() -> pd.DataFrame:
-    if not DATA_FILE.exists() or DATA_FILE.stat().st_size == 0:
-        return pd.DataFrame()
-    return pd.read_csv(DATA_FILE, parse_dates=["Transaction Date"])
+def load_data() -> tuple[pd.DataFrame, bool]:
+    """Returns (dataframe, is_demo).  Falls back to demo_data.csv when no real data exists."""
+    if DATA_FILE.exists() and DATA_FILE.stat().st_size > 0:
+        return pd.read_csv(DATA_FILE, parse_dates=["Transaction Date"]), False
+    if DEMO_FILE.exists():
+        return pd.read_csv(DEMO_FILE, parse_dates=["Transaction Date"]), True
+    return pd.DataFrame(), False
 
 
 def save_data(df: pd.DataFrame):
@@ -330,7 +334,7 @@ def ingest(files) -> int:
         return 0
 
     new = pd.concat(parsed, ignore_index=True)
-    existing = load_data()
+    existing, _ = load_data()
 
     if not existing.empty:
         combined = pd.concat([existing, new], ignore_index=True)
@@ -350,7 +354,7 @@ def ingest(files) -> int:
 
 
 def delete_rows(keys_to_remove: list):
-    raw = load_data()
+    raw, _ = load_data()
     raw_key = (
         raw["Transaction Date"].astype(str) + "|"
         + raw["Description"] + "|"
@@ -461,20 +465,28 @@ with st.sidebar:
             st.info("No new transactions (already imported)")
         st.rerun()
 
-    raw = load_data()
+    raw, _is_demo_sidebar = load_data()
     if not raw.empty:
         st.divider()
         st.caption(f"{len(raw)} total transactions stored")
-        if st.button("Clear All Data", type="secondary"):
-            DATA_FILE.unlink(missing_ok=True)
-            OVR_FILE.unlink(missing_ok=True)
-            st.rerun()
+        if not _is_demo_sidebar:
+            if st.button("Clear All Data", type="secondary"):
+                DATA_FILE.unlink(missing_ok=True)
+                OVR_FILE.unlink(missing_ok=True)
+                st.rerun()
 
 # ── Gate ──────────────────────────────────────────────────────────────────────
-raw = load_data()
+raw, is_demo = load_data()
 if raw.empty:
     st.info("⬆️  Upload a Bank Muscat credit card statement XLS to get started.")
     st.stop()
+
+if is_demo:
+    st.info(
+        "👋 **Demo mode** — you're viewing sample data so you can explore the app. "
+        "Upload your own Bank Muscat XLS statement in the sidebar to see your real numbers.",
+        icon="📊",
+    )
 
 df = apply_overrides(raw, overrides)
 
