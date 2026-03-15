@@ -516,42 +516,20 @@ with t_overview:
     if flt.empty:
         st.warning("No transactions for the selected filters.")
     else:
-        # Core numbers
-        cycle_list    = sorted(flt["Month"].unique())
+        # ── Core numbers ───────────────────────────────────────────────────────
+        cycle_list     = sorted(flt["Month"].unique())
         monthly_totals = flt.groupby("Month")["Amount"].sum()
-        cycle_avg     = monthly_totals.mean()
-        latest_cycle  = cycle_list[-1]
-        latest_total  = monthly_totals[latest_cycle]
-        prev_cycle    = cycle_list[-2] if len(cycle_list) >= 2 else None
-        prev_total    = monthly_totals[prev_cycle] if prev_cycle else None
-
-        # ── Row 1: 3 clear KPI cards ───────────────────────────────────────────
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            delta_vs_prev = (
-                f"{((latest_total - prev_total) / prev_total * 100):+.0f}% vs {cycle_label(prev_cycle)}"
-                if prev_total else None
-            )
-            st.metric("Latest Cycle Spend", f"OMR {latest_total:,.0f}",
-                      delta=delta_vs_prev, delta_color="inverse")
-            st.caption(cycle_dates(latest_cycle))
-
-        with c2:
-            st.metric("Monthly Average", f"OMR {cycle_avg:,.0f}",
-                      help=f"Mean across {len(cycle_list)} billing cycles")
-            over_under = latest_total - cycle_avg
-            sign = "over" if over_under > 0 else "under"
-            st.caption(f"Latest is OMR {abs(over_under):,.0f} {sign} average")
-
-        with c3:
-            latest_cat_df = flt[flt["Month"] == latest_cycle]
-            cat_totals    = latest_cat_df.groupby("Category")["Amount"].sum()
-            top_cat       = cat_totals.idxmax()
-            top_cat_pct   = cat_totals.max() / cat_totals.sum() * 100
-            st.metric("Top Category", top_cat,
-                      f"OMR {cat_totals.max():,.0f}  ({top_cat_pct:.0f}% of spend)")
-            st.caption(f"In {cycle_label(latest_cycle)}")
+        cycle_avg      = monthly_totals.mean()
+        latest_cycle   = cycle_list[-1]
+        latest_total   = monthly_totals[latest_cycle]
+        prev_cycle     = cycle_list[-2] if len(cycle_list) >= 2 else None
+        prev_total     = monthly_totals[prev_cycle] if prev_cycle else None
+        latest_data    = flt[flt["Month"] == latest_cycle]
+        biggest_item   = latest_data["Amount"].max() if not latest_data.empty else 0
+        biggest_merch  = (
+            latest_data.loc[latest_data["Amount"].idxmax(), "Description"][:28]
+            if not latest_data.empty else ""
+        )
 
         # Others warning — only shown when total unclassified spend is material
         others_amt = flt[flt["Category"] == "Others"]["Amount"].sum()
@@ -562,67 +540,55 @@ with t_overview:
                 f"fix in **Reclassify** tab."
             )
 
-        st.divider()
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 1 — THIS CYCLE
+        # ══════════════════════════════════════════════════════════════════════
+        st.subheader(f"This Cycle — {cycle_label(latest_cycle)}")
+        st.caption(cycle_dates(latest_cycle))
 
-        # ── Row 2: Spend per cycle — full width ────────────────────────────────
-        st.subheader("Spend per Billing Cycle")
-        monthly = monthly_totals.reset_index()
-        monthly.columns = ["Month", "Amount"]
-        monthly["Label"]    = monthly["Month"].apply(lambda m: cycle_label(m))
-        monthly["AmtText"]  = monthly["Amount"].round(0).astype(int).apply(lambda v: f"OMR {v:,}")
-        monthly["AboveAvg"] = monthly["Amount"] > cycle_avg
+        # ── 4 KPI cards ────────────────────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
 
-        bar_colors = [
-            "#ef9a9a" if above else "#90caf9"
-            for above in monthly["AboveAvg"]
-        ]
-        y_max = monthly["Amount"].max() * 1.22   # headroom so outside-text doesn't clip
+        with c1:
+            delta_vs_prev = (
+                f"{((latest_total - prev_total) / prev_total * 100):+.0f}% vs {cycle_label(prev_cycle)}"
+                if prev_total else None
+            )
+            st.metric("Total Spend", f"OMR {latest_total:,.0f}",
+                      delta=delta_vs_prev, delta_color="inverse")
 
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Bar(
-            x=monthly["Label"],
-            y=monthly["Amount"],
-            marker_color=bar_colors,
-            text=monthly["AmtText"],
-            textposition="outside",
-            name="Cycle spend",
-            hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<extra></extra>",
-        ))
-        fig_trend.add_hline(
-            y=cycle_avg,
-            line_dash="dot", line_color="#555", line_width=2,
-            annotation_text=f"Avg  OMR {cycle_avg:,.0f}",
-            annotation_position="top left",
-            annotation_font_color="#555",
-        )
-        fig_trend.update_layout(
-            xaxis_title="", yaxis_title="OMR",
-            yaxis=dict(tickformat=",d", range=[0, y_max]),
-            showlegend=False,
-            margin=dict(t=20, b=0), height=310,
-        )
-        st.plotly_chart(fig_trend, use_container_width=True, config=CHART_CFG)
-        st.caption("🔴 Above your average  🔵 Below your average")
+        with c2:
+            over_under = latest_total - cycle_avg
+            sign       = "over" if over_under > 0 else "under"
+            st.metric("vs Your Average", f"OMR {abs(over_under):,.0f} {sign}",
+                      help=f"Your average across {len(cycle_list)} cycles is OMR {cycle_avg:,.0f}")
+
+        with c3:
+            cat_totals  = latest_data.groupby("Category")["Amount"].sum()
+            top_cat     = cat_totals.idxmax()
+            top_cat_pct = cat_totals.max() / cat_totals.sum() * 100
+            st.metric("Top Category", top_cat,
+                      f"OMR {cat_totals.max():,.0f}  ·  {top_cat_pct:.0f}%")
+
+        with c4:
+            st.metric("Biggest Single Item", f"OMR {biggest_item:,.0f}")
+            st.caption(biggest_merch)
 
         st.divider()
 
-        # ── Row 3: Where the money goes (left) + Recent big expenses (right) ───
+        # ── Category breakdown (latest cycle) + Top transactions ───────────────
         col_left, col_right = st.columns([1, 1])
 
         with col_left:
-            st.subheader("Where Your Money Goes")
+            st.markdown("**Spend by Category**")
             cat_df = (
-                flt.groupby("Category")["Amount"].sum()
+                latest_data.groupby("Category")["Amount"].sum()
                 .reset_index().sort_values("Amount", ascending=False)
             )
-            if len(cat_df) > 6:
-                other_sum = cat_df.iloc[6:]["Amount"].sum()
-                cat_df = pd.concat([
-                    cat_df.head(6),
-                    pd.DataFrame([{"Category": "Other categories", "Amount": other_sum}]),
-                ], ignore_index=True)
             cat_df["Pct"]    = (cat_df["Amount"] / cat_df["Amount"].sum() * 100).round(1)
-            cat_df["_label"] = cat_df["Amount"].round(0).astype(int).apply(lambda v: f"OMR {v:,}")
+            cat_df["_label"] = cat_df.apply(
+                lambda r: f"OMR {int(round(r['Amount'])):,}  ({r['Pct']:.0f}%)", axis=1
+            )
             cat_df = cat_df.sort_values("Amount", ascending=True)
 
             fig_cat = px.bar(
@@ -637,26 +603,65 @@ with t_overview:
             fig_cat.update_layout(
                 showlegend=False,
                 xaxis=dict(showticklabels=False, title="",
-                           range=[0, cat_df["Amount"].max() * 1.3]),
+                           range=[0, cat_df["Amount"].max() * 1.45]),
                 yaxis_title="",
-                margin=dict(t=10, b=0, r=10), height=310,
+                margin=dict(t=5, b=0, r=10),
+                height=max(280, len(cat_df) * 36),
             )
             st.plotly_chart(fig_cat, use_container_width=True, config=CHART_CFG)
 
         with col_right:
-            st.subheader(f"Biggest Expenses — {cycle_label(latest_cycle)}")
-            latest_data = flt[flt["Month"] == latest_cycle]
+            st.markdown("**Top Transactions**")
             top_txns = (
                 latest_data.nlargest(12, "Amount")
                 [["Transaction Date", "Description", "Amount", "Category"]].copy()
             )
             top_txns["Transaction Date"] = top_txns["Transaction Date"].dt.strftime("%d %b")
-            top_txns["Amount"] = top_txns["Amount"].round(0).astype(int)
-            top_txns["Description"] = top_txns["Description"].str[:32]
+            top_txns["Amount"]           = top_txns["Amount"].round(0).astype(int)
             top_txns = top_txns.rename(columns={
                 "Transaction Date": "Date", "Amount": "OMR", "Description": "Merchant",
             })
-            st.dataframe(top_txns, hide_index=True, use_container_width=True, height=310)
+            st.dataframe(top_txns, hide_index=True, use_container_width=True,
+                         height=max(280, len(cat_df) * 36))
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 2 — SPENDING HISTORY
+        # ══════════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("Spending History")
+
+        monthly = monthly_totals.reset_index()
+        monthly.columns    = ["Month", "Amount"]
+        monthly["Label"]   = monthly["Month"].apply(cycle_label)
+        monthly["AmtText"] = monthly["Amount"].round(0).astype(int).apply(lambda v: f"OMR {v:,}")
+        monthly["AboveAvg"] = monthly["Amount"] > cycle_avg
+
+        bar_colors = ["#ef9a9a" if a else "#90caf9" for a in monthly["AboveAvg"]]
+        y_max      = monthly["Amount"].max() * 1.22
+
+        fig_trend = go.Figure()
+        fig_trend.add_trace(go.Bar(
+            x=monthly["Label"], y=monthly["Amount"],
+            marker_color=bar_colors,
+            text=monthly["AmtText"], textposition="outside",
+            name="Cycle spend",
+            hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<extra></extra>",
+        ))
+        fig_trend.add_hline(
+            y=cycle_avg,
+            line_dash="dot", line_color="#555", line_width=2,
+            annotation_text=f"Avg  OMR {cycle_avg:,.0f}",
+            annotation_position="top left",
+            annotation_font_color="#555",
+        )
+        fig_trend.update_layout(
+            xaxis_title="", yaxis_title="OMR",
+            yaxis=dict(tickformat=",d", range=[0, y_max]),
+            showlegend=False,
+            margin=dict(t=20, b=0), height=320,
+        )
+        st.plotly_chart(fig_trend, use_container_width=True, config=CHART_CFG)
+        st.caption("🔴 Above your average  🔵 Below your average")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
