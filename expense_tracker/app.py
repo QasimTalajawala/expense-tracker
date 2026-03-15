@@ -560,15 +560,17 @@ with t_overview:
         with c2:
             over_under = latest_total - cycle_avg
             sign       = "over" if over_under > 0 else "under"
-            st.metric("vs Your Average", f"OMR {abs(over_under):,.0f} {sign}",
-                      help=f"Your average across {len(cycle_list)} cycles is OMR {cycle_avg:,.0f}")
+            st.metric("Monthly Average", f"OMR {cycle_avg:,.0f}",
+                      help=f"Mean across {len(cycle_list)} billing cycles")
+            st.caption(f"Latest is OMR {abs(over_under):,.0f} {sign} average")
 
         with c3:
             cat_totals  = latest_data.groupby("Category")["Amount"].sum()
             top_cat     = cat_totals.idxmax()
             top_cat_pct = cat_totals.max() / cat_totals.sum() * 100
             st.metric("Top Category", top_cat,
-                      f"OMR {cat_totals.max():,.0f}  ·  {top_cat_pct:.0f}%")
+                      f"OMR {cat_totals.max():,.0f}  ·  {top_cat_pct:.0f}%",
+                      delta_color="off")
 
         with c4:
             st.metric("Biggest Single Item", f"OMR {biggest_item:,.0f}")
@@ -589,7 +591,7 @@ with t_overview:
             cat_df["_label"] = cat_df.apply(
                 lambda r: f"OMR {int(round(r['Amount'])):,}  ({r['Pct']:.0f}%)", axis=1
             )
-            cat_df = cat_df.sort_values("Amount", ascending=True)
+            cat_df = cat_df.sort_values("Amount", ascending=False)
 
             fig_cat = px.bar(
                 cat_df, x="Amount", y="Category", orientation="h",
