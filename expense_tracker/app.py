@@ -24,8 +24,11 @@ CATEGORIES = [
     "Fuel",
     "Telecom",
     "Utilities & Government",
+    "Insurance",
+    "Subscriptions",
     "Healthcare",
     "Shopping & Retail",
+    "Gold & Jewellery",
     "Automotive",
     "Travel & Transport",
     "Entertainment",
@@ -39,11 +42,41 @@ CATEGORIES = [
 RULES = [
     ("Payment",                ["PAYMENT RECEIVED"]),
 
+    # ── High-priority overrides of the generic rules below ────────────────────
+    # Named food chains are never a travel merchant even inside an airport.
+    # Without this, "MCDONALDS -DXB AIRPORT" hit the Travel keyword "AIRPORT"
+    # first and was booked as transport rather than a meal.
+    ("Food & Dining",          ["MCDONALD", "KFC", "BURGER KING", "SUBWAY SANDWICH",
+                                "STARBUCKS", "COSTA COFFEE", "DUNKIN",
+                                "BASKIN", "PAPPA ROTI", "TIM HORTON"]),
+
+    # Gold and jewellery are asset purchases, not retail spending — mixing them
+    # into Shopping & Retail made that category's trend unreadable.
+    ("Gold & Jewellery",       ["JEWELLER", "JEWELRY", "JEWELLERY", "KALYAN",
+                                "DAMAS", "MALABAR GOLD", "JOYALUKKAS",
+                                "GOLD SOUQ", "BULLION",
+                                "TISSOT", "ROLEX", "SEIKO", "CASIO", "SWATCH"]),
+
+    # Software and content subscriptions. These were landing in Education
+    # (via a manual override) or Others, both of which hid a recurring cost.
+    ("Subscriptions",          ["ANTHROPIC", "CLAUDE.AI", "OPENAI", "CHATGPT",
+                                "NETFLIX", "SPOTIFY", "ADOBE", "MICROSOFT",
+                                "GITHUB", "DROPBOX", "ICLOUD", "APPLE.COM",
+                                "GOOGLE STORAGE", "YOUTUBE PREMIUM",
+                                "SHAHID", "OSN", "DISNEY"]),
+
+    # Insurance was split across Utilities & Government and Automotive
+    # depending on the provider, so no single figure showed what it cost.
+    ("Insurance",              ["INSURANCE", "TAKAFUL", "ARABIAFALCON",
+                                "ASSURANCE", "INSURE"]),
+
     ("Food Delivery",          ["TALABAT PRO", "TALABAT", "NOON FOOD",
                                 "HUNGERSTATION", "DELIVEROO"]),
 
     ("Fuel",                   ["OMAN OIL", "SHELL OMAN", "SHELL", "STATION 10",
-                                "AL MAHA", "BP TANKSTELLE", "BP LEIKERMOSER"]),
+                                "AL MAHA", "BP TANKSTELLE", "BP LEIKERMOSER",
+                                " F.S",           # Omani filling stations, e.g. "QURUM HEIGHTS F.S"
+                                ]),
 
     ("Telecom",                ["OMANTEL", "OOREDOO", "VODAFONE"]),
 
@@ -271,6 +304,13 @@ MERCHANT_ALIASES = [
     ("Horizon Fitness",  ["HORIZON FITNESS"]),
     ("Kalyan Jewellers", ["KALYAN"]),
     ("British Council",  ["BRITISH COUNCIL"]),
+    # A mid-string gateway prefix ("NAJAFYIA* NAJAFYIA.ORG") isn't caught by
+    # _GATEWAY, which only strips a leading one — so these split into two
+    # merchants and appeared as two separate rows.
+    ("Najafyia",         ["NAJAFYIA"]),
+    ("Shara Mills & Dates", ["SHARA MILLS"]),
+    ("Claude / Anthropic",  ["ANTHROPIC", "CLAUDE.AI"]),
+    ("Qurum Heights F.S",   ["QURUM HEIGHTS"]),
     ("McDonald's",       ["MCDONALD"]),
     ("Starbucks",        ["STARBUCKS"]),
     ("IKEA",             ["IKEA"]),
@@ -538,6 +578,8 @@ def recurring_merchants(df, cycles, window=6, min_hits=4) -> set:
 EPISODIC_CATS = {
     "Travel & Transport", "Shopping & Retail",
     "Education", "Healthcare", "Charity & Donations",
+    "Gold & Jewellery",   # asset purchases: rare, large
+    "Insurance",          # annual premiums, so lumpy rather than monthly
 }
 
 
