@@ -15,7 +15,8 @@ warnings.filterwarnings("ignore")
 BASE_DIR   = Path(__file__).parent
 DATA_FILE  = BASE_DIR / "expense_data.csv"
 DEMO_FILE  = BASE_DIR / "demo_data.csv"
-OVR_FILE   = BASE_DIR / "category_overrides.json"
+OVR_FILE    = BASE_DIR / "category_overrides.json"
+COMMIT_FILE = BASE_DIR / "commitments.json"
 
 CATEGORIES = [
     "Groceries",
@@ -378,6 +379,45 @@ def apply_overrides(df: pd.DataFrame, overrides: dict) -> pd.DataFrame:
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 
+def load_commitments() -> list:
+    """Fixed outgoings paid outside the credit card (rent, cleaners, donations).
+
+    Kept as a hand-maintained list rather than imported from the bank statement.
+    On a sample of that account only ~7% of what was debited was actually
+    household spending — the rest was investment transfers, the credit-card
+    settlement (which would double-count this entire tool), loan principal and
+    money lent and returned. Worse, the spending that IS there cannot be
+    separated by rule: "Transfer <person>" is a cleaner in one row and a
+    repayment to a friend in the next. These amounts are fixed and known, so
+    typing them once is both simpler and more accurate than parsing.
+    """
+    if not COMMIT_FILE.exists():
+        return []
+    try:
+        raw = json.loads(COMMIT_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    out = []
+    for r in raw if isinstance(raw, list) else []:
+        try:
+            amt = float(r.get("amount", 0))
+        except (TypeError, ValueError):
+            continue
+        name = str(r.get("name", "")).strip()
+        if name and amt > 0:
+            out.append({"name": name, "amount": amt,
+                        "period": "year" if r.get("period") == "year" else "month"})
+    return out
+
+
+def save_commitments(rows: list):
+    COMMIT_FILE.write_text(json.dumps(rows, indent=2))
+
+
+def monthly_cost(c: dict) -> float:
+    return c["amount"] / 12 if c["period"] == "year" else c["amount"]
+
+
 def load_overrides() -> dict:
     return json.loads(OVR_FILE.read_text()) if OVR_FILE.exists() else {}
 
@@ -701,7 +741,8 @@ def category_movers(df, cur_cycle, base_cycles, top_n=3) -> pd.DataFrame:
 st.set_page_config(page_title="BM Expense Tracker", page_icon="💳", layout="wide")
 st.title("💳 Bank Muscat Expense Tracker")
 
-overrides = load_overrides()
+overrides   = load_overrides()
+COMMITMENTS = load_commitments()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -951,25 +992,61 @@ if view == "Overview":
                 f"excluded everywhere except the transaction list."
             )
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
+        # Commitments are shown alongside the card, never folded into it: every
+        # chart, category and trend in this tool is built from card statements,
+        # so mixing a flat monthly figure into them would corrupt the history.
+        commit_mo = sum(monthly_cost(c) for c in COMMITMENTS)
+
+        cols = st.columns(4 if commit_mo else 3)
+        with cols[0]:
             # Spell out the date range: a "cycle" runs 3rd-to-2nd, so "Jul 2026"
             # is not the calendar month and that trips people up.
-            stat_tile(f"Last complete cycle · {cycle_label(latest)}",
+            stat_tile(f"Card · {cycle_label(latest)}",
                       f"OMR {latest_tot:,.0f}",
                       f"{cycle_dates(latest)} · {verdict}")
-        with c2:
-            stat_tile("Typical cycle", f"OMR {TYPICAL:,.0f}",
+        with cols[1]:
+            stat_tile("Typical cycle · card", f"OMR {TYPICAL:,.0f}",
                       f"normal range {BAND_LO:,.0f}–{BAND_HI:,.0f}",
                       tip="Median and the middle half (25th–75th percentile) of your "
                           "complete cycles. Your spending is a steady base plus "
                           "occasional travel, so a single average is a poor reference.")
-        with c3:
-            stat_tile(f"Last {len(last6)} cycles",
-                      f"OMR {cycle_totals[last6].sum():,.0f}",
-                      f"OMR {cycle_totals[last6].mean():,.0f} per cycle")
+        if commit_mo:
+            with cols[2]:
+                stat_tile("Fixed commitments", f"OMR {commit_mo:,.0f}",
+                          ", ".join(c["name"] for c in COMMITMENTS[:3])
+                          + (" …" if len(COMMITMENTS) > 3 else ""),
+                          tip="Paid outside the card — set in Setup. Not included in "
+                              "any category, chart or trend below, all of which come "
+                              "from card statements.")
+            with cols[3]:
+                stat_tile("Typical month, all in", f"OMR {TYPICAL + commit_mo:,.0f}",
+                          f"card {TYPICAL:,.0f} + fixed {commit_mo:,.0f}")
+        else:
+            with cols[2]:
+                stat_tile(f"Last {len(last6)} cycles",
+                          f"OMR {cycle_totals[last6].sum():,.0f}",
+                          f"OMR {cycle_totals[last6].mean():,.0f} per cycle")
 
         st.divider()
+
+        if commit_mo:
+            with st.expander(f"What's in the OMR {commit_mo:,.0f} of fixed commitments"):
+                cdf = pd.DataFrame([
+                    {"Commitment": c["name"],
+                     "Amount": c["amount"],
+                     "Billed": c["period"],
+                     "Per month": round(monthly_cost(c), 2)}
+                    for c in sorted(COMMITMENTS, key=monthly_cost, reverse=True)
+                ])
+                st.dataframe(cdf, hide_index=True, width="stretch",
+                             height=38 + len(cdf) * 35,
+                             column_config={
+                                 "Amount": st.column_config.NumberColumn(format="%.0f"),
+                                 "Per month": st.column_config.NumberColumn(format="%.2f"),
+                             })
+                st.caption("Edit these in **⚙️ Setup**. They are added to the "
+                           "all-in total above and are deliberately kept out of the "
+                           "charts below, which come from card statements only.")
 
         st.subheader("Spend per cycle")
         st.plotly_chart(band_chart(cycle_totals, height=320),
@@ -1452,6 +1529,53 @@ if view == "Transactions":
 # SETUP — configuration, not analysis
 # ════════════════════════════════════════════════════════════════════════════════
 if view == "⚙️ Setup":
+    # ── Fixed commitments ──────────────────────────────────────────────────────
+    st.subheader("Fixed commitments")
+    st.caption(
+        "Regular outgoings paid outside the credit card — rent, cleaners, "
+        "donations. Add or edit rows directly; a yearly amount is spread across "
+        "twelve months. These feed the all-in total on Overview and are kept out "
+        "of the categories and trends, which come from card statements only."
+    )
+
+    _c_df = pd.DataFrame(COMMITMENTS or [{"name": "", "amount": 0.0, "period": "month"}])
+    _c_df = _c_df.rename(columns={"name": "Commitment", "amount": "Amount",
+                                  "period": "Billed"})
+    edited_c = st.data_editor(
+        _c_df[["Commitment", "Amount", "Billed"]],
+        num_rows="dynamic", hide_index=True, width="stretch", key="commit_editor",
+        column_config={
+            "Commitment": st.column_config.TextColumn(required=False),
+            "Amount": st.column_config.NumberColumn(format="%.2f", min_value=0.0),
+            "Billed": st.column_config.SelectboxColumn(options=["month", "year"],
+                                                       default="month"),
+        },
+    )
+
+    _rows = [
+        {"name": str(r["Commitment"]).strip(),
+         "amount": float(r["Amount"] or 0),
+         "period": r["Billed"] if r["Billed"] in ("month", "year") else "month"}
+        for _, r in edited_c.iterrows()
+        if str(r.get("Commitment", "")).strip() and float(r.get("Amount") or 0) > 0
+    ]
+    _new_total = sum(monthly_cost(c) for c in _rows)
+
+    cc1, cc2 = st.columns([2, 5])
+    with cc1:
+        if st.button("Save commitments", type="primary",
+                     disabled=(_rows == COMMITMENTS)):
+            save_commitments(_rows)
+            st.success(f"Saved {len(_rows)} commitment(s).")
+            st.rerun()
+    with cc2:
+        st.caption(f"Monthly total: **OMR {_new_total:,.2f}**"
+                   + ("  ·  unsaved changes" if _rows != COMMITMENTS else ""))
+
+    st.divider()
+
+    # ── Merchant classification ────────────────────────────────────────────────
+    st.subheader("Merchant categories")
     st.caption(
         "Override the auto-classification for any merchant. "
         "Saved changes apply to all past and future transactions from that merchant."
