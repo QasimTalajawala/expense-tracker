@@ -51,19 +51,22 @@ RULES = [
                                 "BASKIN", "PAPPA ROTI", "TIM HORTON"]),
 
     # Gold and jewellery are asset purchases, not retail spending — mixing them
-    # into Shopping & Retail made that category's trend unreadable.
+    # into Shopping & Retail made that category's trend unreadable. Watches are
+    # deliberately NOT here: they get used rather than held, so they stay retail.
     ("Gold & Jewellery",       ["JEWELLER", "JEWELRY", "JEWELLERY", "KALYAN",
                                 "DAMAS", "MALABAR GOLD", "JOYALUKKAS",
-                                "GOLD SOUQ", "BULLION",
-                                "TISSOT", "ROLEX", "SEIKO", "CASIO", "SWATCH"]),
+                                "GOLD SOUQ", "BULLION"]),
 
-    # Software and content subscriptions. These were landing in Education
-    # (via a manual override) or Others, both of which hid a recurring cost.
+    # Recurring subscriptions and memberships, so the total standing commitment
+    # is visible in one place. Anthropic/Claude had been overridden into
+    # Education and the gym sat in Healthcare, hiding both.
     ("Subscriptions",          ["ANTHROPIC", "CLAUDE.AI", "OPENAI", "CHATGPT",
                                 "NETFLIX", "SPOTIFY", "ADOBE", "MICROSOFT",
                                 "GITHUB", "DROPBOX", "ICLOUD", "APPLE.COM",
                                 "GOOGLE STORAGE", "YOUTUBE PREMIUM",
-                                "SHAHID", "OSN", "DISNEY"]),
+                                "SHAHID", "OSN", "DISNEY",
+                                "FITNESS", "GYM", "HEALTH CLUB",  # memberships
+                                ]),
 
     # Insurance was split across Utilities & Government and Automotive
     # depending on the provider, so no single figure showed what it cost.
@@ -94,7 +97,9 @@ RULES = [
                                 "HOSPITAL", "CLINIC", "HEALTH CENTER", "KIMS",
                                 "IHERB",          # health supplements
                                 "DENTAL", "CHIRO",
-                                "CPAP", "FITNESS", "GYM",
+                                "CPAP",
+                                # FITNESS / GYM moved to Subscriptions — a gym is
+                                # a recurring membership, not medical spending.
                                 ]),
 
     ("Travel & Transport",     [# Online travel & agencies
@@ -145,6 +150,7 @@ RULES = [
                                 "EDEKA", "ALDI",
                                 "GEMISCHTWARENHANDEL",  # German general goods store
                                 "INVEST FRUI",    # fruit/produce traders (BUSINESS RFED INVEST FRUI)
+                                "SHARA MILLS",    # dates and grains — a provisions shop, not a restaurant
                                 ]),
 
     ("Shopping & Retail",      ["AMERICAN EAGLE", "PIERRE CARDIN", "H&M", "ZARA", "MARKS",
@@ -181,7 +187,7 @@ RULES = [
                                 "TRATTORIA",
                                 # Muscat & Oman restaurants/cafes
                                 "SOURDOUGH", "REVEAL", "WINDROSE", "BOOM", "FLAMES",
-                                "AL RAVI", "AL HAWAS", "SHARA MILLS", "AL SHARA MILLS",
+                                "AL RAVI", "AL HAWAS",
                                 "YOGRAT", "YOUGRAT", "BURJ AL DHABI", "MAMOURA",
                                 "SIKANDAR", "WHITE STAR", "JAMOCHA",
                                 "KALABASH", "BEGUM", "MEAT MOOT", "IMPERIAL KITCHEN",
