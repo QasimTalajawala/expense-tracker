@@ -4,8 +4,9 @@ __pycache__/
 *.pyo
 .env
 
-# Streamlit
-.streamlit/
+# Streamlit — secrets only. config.toml carries the app theme and must ship,
+# including to Streamlit Cloud.
+.streamlit/secrets.toml
 
 # Data files (personal financial data — keep out of git)
 expense_tracker/expense_data.csv

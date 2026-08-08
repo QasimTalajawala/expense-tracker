@@ -1,0 +1,12 @@
+[theme]
+# Matches the chart palette (validated categorical slot 1) so accents, the tab
+# underline, progress bars and widget highlights all read as one system instead
+# of Streamlit's default red fighting the blue charts.
+primaryColor            = "#2a78d6"
+backgroundColor         = "#ffffff"
+secondaryBackgroundColor = "#f4f4f2"
+textColor               = "#0b0b0b"
+font                    = "sans serif"
+
+[client]
+toolbarMode = "minimal"
