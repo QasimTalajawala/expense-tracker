@@ -1736,15 +1736,45 @@ with t_reclassify:
         "Saved changes apply to all past and future transactions from that merchant."
     )
 
-    summary = (
-        expenses.groupby(["Description", "Category"])["Amount"]
-        .agg(Total="sum", Count="count").reset_index()
-        .sort_values("Total", ascending=False)
+    # One row per canonical merchant, not per raw bank string.  The overrides
+    # file keys on the raw `Description` (and `apply_overrides` matches on it),
+    # so keep the merchant → descriptions map: a single choice below is written
+    # out as one override entry per variant.  Built from `expenses` only, so a
+    # payment row is never recategorised by a merchant edit.
+    merch_descs = (
+        expenses.groupby("Merchant")["Description"]
+        .apply(lambda s: sorted(s.unique()))
+        .to_dict()
     )
 
+    per_cat = (
+        expenses.groupby(["Merchant", "Category"])["Amount"]
+        .agg(Total="sum", Count="count").reset_index()
+    )
+
+    # A merchant's variants can carry different categories — either because the
+    # keyword rules split them, or because an older per-description override
+    # covered only some.  Show the dominant one (most transactions, ties broken
+    # by spend then name so it is stable) and flag the merchant as mixed.
+    dominant = (
+        per_cat.sort_values(["Count", "Total", "Category"],
+                            ascending=[False, False, True])
+        .drop_duplicates("Merchant").set_index("Merchant")["Category"]
+    )
+    others_omr = (
+        per_cat[per_cat["Category"] == "Others"].groupby("Merchant")["Total"].sum()
+    )
+
+    summary = per_cat.groupby("Merchant").agg(
+        Total=("Total", "sum"), Count=("Count", "sum"), NCats=("Category", "size"),
+    ).reset_index()
+    summary["Category"] = summary["Merchant"].map(dominant)
+    summary["Mixed"]    = summary["NCats"] > 1
+    summary["Others"]   = summary["Merchant"].map(others_omr).fillna(0.0)
+
     # ── Others summary banner ──────────────────────────────────────────────────
-    others_summary = summary[summary["Category"] == "Others"]
-    total_others_omr = others_summary["Total"].sum()
+    others_summary = summary[summary["Others"] > 0]
+    total_others_omr = others_summary["Others"].sum()
     n_others_merch   = len(others_summary)
     if n_others_merch > 0:
         if total_others_omr <= OTHERS_WARN_OMR:
@@ -1772,43 +1802,74 @@ with t_reclassify:
         st.success("All manual overrides cleared.")
         st.rerun()
 
+    # Anything with unclassified spend first — including a merchant only partly
+    # in Others — then everything else by size.
     others_first = pd.concat([
-        summary[summary["Category"] == "Others"],
-        summary[summary["Category"] != "Others"],
+        summary[summary["Others"] > 0].sort_values("Others", ascending=False),
+        summary[summary["Others"] == 0].sort_values("Total", ascending=False),
     ])
 
     if show_others_only:
-        others_first = others_first[others_first["Category"] == "Others"]
+        others_first = others_first[others_first["Others"] > 0]
 
-    # Apply the minimum-amount filter only to Others rows
+    # Apply the minimum-amount filter to the unclassified portion only
     others_first = others_first[
-        (others_first["Category"] != "Others") |
-        (others_first["Total"] >= min_omr)
+        (others_first["Others"] == 0) | (others_first["Others"] >= min_omr)
     ]
 
     if others_first.empty:
         st.info(f"No merchants to show (all Others items are below OMR {min_omr}).")
     else:
-        pending = {}
+        pending = {}          # raw Description → category, the overrides file format
+        touched = 0           # merchants the user actually changed
         for _, row in others_first.iterrows():
-            desc    = row["Description"]
-            current = overrides.get(desc, row["Category"])
+            merch    = row["Merchant"]
+            variants = merch_descs.get(merch, [])
+            current  = row["Category"]
+
             c1, c2, c3 = st.columns([4, 3, 2])
-            c1.text(desc[:55])
+            c1.text(merch[:55])
+
+            note = []
+            if len(variants) > 1:
+                note.append(f"{len(variants)} bank descriptions")
+            if row["Mixed"]:
+                mix = per_cat[per_cat["Merchant"] == merch].sort_values(
+                    "Count", ascending=False)["Category"].tolist()
+                note.append("⚠️ mixed: " + ", ".join(mix))
+            if note:
+                c1.caption("  ·  ".join(note))
+
             sel = c2.selectbox(
                 "",
                 CATEGORIES,
                 index=CATEGORIES.index(current) if current in CATEGORIES else 0,
-                key=f"r_{desc}",
+                key=f"r_{merch}",
                 label_visibility="collapsed",
             )
+
+            # Picking a new category already rewrites every variant.  The
+            # checkbox only exists so a mixed merchant can be unified onto the
+            # category it already shows.
+            unify = row["Mixed"] and c1.checkbox(
+                "Apply to all variants", key=f"u_{merch}"
+            )
+
             c3.caption(f"OMR {round(row['Total']):,}  ·  {int(row['Count'])} txns")
-            if sel != current:
-                pending[desc] = sel
+            if 0 < row["Others"] < row["Total"]:
+                c3.caption(f"OMR {round(row['Others']):,} unclassified")
+
+            if sel != current or unify:
+                touched += 1
+                for d in variants:            # one entry per raw description
+                    pending[d] = sel
 
         st.divider()
         if st.button("Save Overrides", type="primary", disabled=not pending):
             overrides.update(pending)
             save_overrides(overrides)
-            st.success(f"Saved {len(pending)} override(s).")
+            st.success(
+                f"Saved {touched} merchant change(s) "
+                f"across {len(pending)} bank description(s)."
+            )
             st.rerun()
