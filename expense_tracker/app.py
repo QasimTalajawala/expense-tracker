@@ -533,17 +533,137 @@ def recurring_merchants(df, cycles, window=6, min_hits=4) -> set:
     return set(hits[hits >= min_hits].index)
 
 
+# ── Everyday vs episodic ──────────────────────────────────────────────────────
+# Measured on 17 cycles of real data: the everyday half runs at OMR ~480/cycle
+# with CV 0.33, while the episodic half swings between OMR 61 and 990 (CV 0.62).
+# Nearly all cycle-to-cycle variance comes from the episodic side, so the two
+# are worth separating rather than averaging together.
+EPISODIC_CATS = {
+    "Travel & Transport", "Shopping & Retail",
+    "Education", "Healthcare", "Charity & Donations",
+}
+
+
+def spend_kind(category: str) -> str:
+    return "Episodic" if category in EPISODIC_CATS else "Everyday"
+
+
+def typical_band(totals: pd.Series) -> tuple[float, float]:
+    """The 25th-75th percentile range of cycle totals.
+
+    A single mean is a poor reference here — only 5 of 17 cycles land within
+    ±15% of it, because spending is a stable base plus occasional travel.
+    """
+    return float(totals.quantile(0.25)), float(totals.quantile(0.75))
+
+
+def pace_curve(df, cycles) -> dict:
+    """Cumulative OMR normally spent by each day of a cycle.
+
+    Returns {day: (p25, median, p75)}.  Compares against where you actually
+    were by this day in past cycles, rather than projecting the current cycle
+    forward — by day 14 real cycles range from 23% to 65% complete, so a
+    point projection implies precision that does not exist.
+    """
+    if not cycles:
+        return {}
+    by_day = {}
+    for ym in cycles:
+        d, start = df[df["Month"] == ym], cycle_start(ym)
+        for day in range(1, 32):
+            cut = start + pd.Timedelta(days=day)
+            by_day.setdefault(day, []).append(
+                d[d["Transaction Date"] < cut]["Amount"].sum()
+            )
+    return {
+        day: (float(pd.Series(v).quantile(0.25)),
+              float(pd.Series(v).median()),
+              float(pd.Series(v).quantile(0.75)))
+        for day, v in by_day.items()
+    }
+
+
+def detect_trips(df, gap_days=5, min_txns=3) -> list:
+    """Group foreign-country spend into trips.
+
+    A trip is the natural unit for episodic spend, and it cuts across
+    categories — meals and shopping abroad belong to the trip, not to
+    Food & Dining.  Domestic-currency online purchases from foreign merchants
+    would create phantom trips, so only rows with a real merchant country and
+    a non-OMR currency count toward detection.
+    """
+    f = df[
+        df["Country"].notna()
+        & ~df["Country"].astype(str).str.upper().isin(["-NIL-", "NAN", "", "OMAN"])
+        & (df["TXN Currency"] != "OMR")
+    ].sort_values("Transaction Date")
+    if f.empty:
+        return []
+
+    trips, cur = [], None
+    for _, r in f.iterrows():
+        if cur and (r["Transaction Date"] - cur["end"]).days <= gap_days:
+            cur["end"] = r["Transaction Date"]
+            cur["rows"].append(r)
+        else:
+            if cur:
+                trips.append(cur)
+            cur = {"start": r["Transaction Date"], "end": r["Transaction Date"], "rows": [r]}
+    if cur:
+        trips.append(cur)
+
+    out = []
+    for t in trips:
+        if len(t["rows"]) < min_txns:
+            continue
+        # Full cost = everything charged in the window, whatever its category
+        window = df[(df["Transaction Date"] >= t["start"] - pd.Timedelta(days=1))
+                    & (df["Transaction Date"] <= t["end"] + pd.Timedelta(days=1))]
+
+        # A real trip involves getting somewhere. Without a flight, hotel or
+        # taxi in the window this is a run of foreign-billed online purchases
+        # — SaaS subscriptions and overseas web orders bill from the US and
+        # would otherwise show up as phantom trips.
+        if not (window["Category"] == "Travel & Transport").any():
+            continue
+
+        # Name only countries you actually spent time in. A single Amazon.ca
+        # order placed mid-trip should not make Canada a destination.
+        rows  = pd.DataFrame(t["rows"])
+        by_c  = rows.groupby("Country").agg(n=("Amount", "size"), amt=("Amount", "sum"))
+        real  = by_c[by_c["n"] >= 2].sort_values("amt", ascending=False)
+        if real.empty:
+            real = by_c.sort_values("amt", ascending=False).head(1)
+        names = [str(c).title() for c in real.index[:3]]
+        label = " · ".join(names)
+        if len(real) > 3:
+            label += f" +{len(real) - 3}"
+
+        days = (t["end"] - t["start"]).days + 1
+        out.append({
+            "Trip": label,
+            "Start": t["start"], "End": t["end"], "Days": days,
+            "Total": float(window["Amount"].sum()),
+            "PerDay": float(window["Amount"].sum()) / days,
+            "Txns": len(window),
+        })
+    return sorted(out, key=lambda x: x["Start"], reverse=True)
+
+
 def category_movers(df, cur_cycle, base_cycles, top_n=3) -> pd.DataFrame:
     """Categories that moved most vs the average of `base_cycles`.
 
     Each row names the single merchant that drove the change, which is the
     question a category-level delta always leaves unanswered.
     """
-    if not base_cycles:
+    cur_cycles = [cur_cycle] if isinstance(cur_cycle, str) else list(cur_cycle)
+    if not base_cycles or not cur_cycles:
         return pd.DataFrame()
 
-    cur  = df[df["Month"] == cur_cycle].groupby("Category")["Amount"].sum()
-    base = df[df["Month"].isin(base_cycles)].groupby("Category")["Amount"].sum() / len(base_cycles)
+    # Both sides are expressed per-cycle so periods of different length compare
+    n_cur, n_base = len(cur_cycles), len(base_cycles)
+    cur  = df[df["Month"].isin(cur_cycles)].groupby("Category")["Amount"].sum() / n_cur
+    base = df[df["Month"].isin(base_cycles)].groupby("Category")["Amount"].sum() / n_base
 
     mv = pd.DataFrame({"Now": cur, "Usual": base}).fillna(0)
     mv["Change"] = mv["Now"] - mv["Usual"]
@@ -551,9 +671,10 @@ def category_movers(df, cur_cycle, base_cycles, top_n=3) -> pd.DataFrame:
 
     drivers = []
     for cat in mv.index:
-        c = df[(df["Month"] == cur_cycle) & (df["Category"] == cat)].groupby("Merchant")["Amount"].sum()
+        c = (df[df["Month"].isin(cur_cycles) & (df["Category"] == cat)]
+             .groupby("Merchant")["Amount"].sum() / n_cur)
         b = (df[df["Month"].isin(base_cycles) & (df["Category"] == cat)]
-             .groupby("Merchant")["Amount"].sum() / len(base_cycles))
+             .groupby("Merchant")["Amount"].sum() / n_base)
         idx = c.index.union(b.index)
         d   = c.reindex(idx).fillna(0) - b.reindex(idx).fillna(0)
         if d.empty:
@@ -667,1070 +788,555 @@ expenses["Type"] = expenses["Merchant"].apply(
 payments = df[df["OMR Amount"] > 0].copy()
 payments["Amount"] = payments["OMR Amount"]  # positive = payment received
 
-# ── Sidebar Filters ───────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("Filters")
-    all_months = sorted(expenses["Month"].unique())
-    cycle_labels_map = {
-        ym: cycle_label(ym) + (" (in progress)" if ym == INPROGRESS else "")
-        for ym in all_months
-    }
-    sel_months = st.multiselect(
-        "Billing Cycle", all_months, default=all_months,
-        format_func=lambda ym: cycle_labels_map.get(ym, ym),
-    )
 
-    all_cats = [c for c in CATEGORIES if c in expenses["Category"].unique() and c != "Payment"]
-    sel_cats = st.multiselect("Category", all_cats, default=all_cats)
+# ── Shared scope ──────────────────────────────────────────────────────────────
+# No sidebar filters: each tab owns its own time scope.  Two competing time
+# controls (a global cycle multiselect plus a per-tab selector) was the main
+# reason it was never clear which period a number referred to.
 
-flt = expenses[
-    expenses["Month"].isin(sel_months) & expenses["Category"].isin(sel_cats)
-].copy()
+expenses["Kind"] = expenses["Category"].apply(spend_kind)
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-t_overview, t_monthly, t_trends, t_travel, t_txns, t_reclassify = st.tabs(
-    ["Overview", "Monthly Deep-Dive", "Trends", "Travel Analysis", "Transactions", "Reclassify"]
+cycle_labels_map = {
+    ym: cycle_label(ym) + (" · in progress" if ym == INPROGRESS else "")
+    for ym in ALL_CYCLES
+}
+cycle_totals = expenses.groupby("Month")["Amount"].sum()
+done_totals  = cycle_totals[COMPLETE_CYCLES] if COMPLETE_CYCLES else cycle_totals
+BAND_LO, BAND_HI = typical_band(done_totals) if len(done_totals) else (0.0, 0.0)
+TYPICAL = float(done_totals.median()) if len(done_totals) else 0.0
+PACE    = pace_curve(expenses, COMPLETE_CYCLES)
+
+BLUE, RED, GREY, TEAL, SAND = "#90caf9", "#ef9a9a", "#e0e0e0", "#80cbc4", "#c5cae9"
+
+t_now, t_explain, t_review, t_setup = st.tabs(
+    ["Now", "Explain", "Review", "⚙️ Setup"]
 )
 
 # ════════════════════════════════════════════════════════════════════════════════
-# OVERVIEW
+# NOW — the every-open screen.  One question: am I on track this cycle?
 # ════════════════════════════════════════════════════════════════════════════════
-with t_overview:
-    if flt.empty:
-        st.warning("No transactions for the selected filters.")
+with t_now:
+    if not COMPLETE_CYCLES:
+        st.warning("Need at least one complete billing cycle before this means anything.")
     else:
-        # ── Cycle scope ────────────────────────────────────────────────────────
-        # Everything comparative uses COMPLETE cycles only.  The in-progress
-        # cycle is reported separately as a run-rate so a 6-day-old cycle never
-        # masquerades as a spending collapse.
-        cycle_list     = sorted(flt["Month"].unique())
-        monthly_totals = flt.groupby("Month")["Amount"].sum()
-        done_cycles    = [c for c in cycle_list if c in COMPLETE_CYCLES]
-        live_cycle     = INPROGRESS if INPROGRESS in cycle_list else None
+        focus      = INPROGRESS or COMPLETE_CYCLES[-1]
+        focus_data = expenses[expenses["Month"] == focus]
+        spent      = float(focus_data["Amount"].sum())
+        live       = focus == INPROGRESS
 
-        if not done_cycles:
-            st.warning(
-                "No complete billing cycles in the current filter — "
-                "every number below would be based on a partial cycle."
-            )
-            done_cycles = cycle_list          # degrade gracefully rather than crash
+        if live:
+            elapsed, total_days = cycle_progress(focus)
+            p25, usual, p75 = PACE.get(elapsed, (0.0, 0.0, 0.0))
+            st.subheader(f"{cycle_label(focus)} · day {elapsed} of {total_days}")
+        else:
+            elapsed = total_days = None
+            p25, usual, p75 = BAND_LO, TYPICAL, BAND_HI
+            st.subheader(f"{cycle_label(focus)} · complete")
+        st.caption(cycle_dates(focus))
 
-        cycle_avg    = monthly_totals[done_cycles].mean()
-        latest_cycle = done_cycles[-1]
-        latest_total = monthly_totals[latest_cycle]
-        latest_data  = flt[flt["Month"] == latest_cycle]
-        base_cycles  = done_cycles[-4:-1]      # the 3 cycles before the latest
-        base_avg     = monthly_totals[base_cycles].mean() if base_cycles else None
-
-        # Others warning — only shown when total unclassified spend is material
-        others_amt = flt[flt["Category"] == "Others"]["Amount"].sum()
-        n_others   = int((flt["Category"] == "Others").sum())
-        if others_amt > OTHERS_WARN_OMR:
-            st.warning(
-                f"OMR {others_amt:,.0f} unclassified across {n_others} transaction(s) — "
-                f"fix in **Reclassify** tab."
-            )
-
-        # ── In-progress cycle: run-rate, not a total ───────────────────────────
-        if live_cycle:
-            elapsed, total_days = cycle_progress(live_cycle)
-            spent_so_far = monthly_totals.get(live_cycle, 0)
-            run_rate     = spent_so_far / elapsed * total_days
-            pace         = run_rate - cycle_avg
-            verdict      = "above" if pace > 0 else "below"
-            st.info(
-                f"**{cycle_label(live_cycle)} is still open** — day {elapsed} of {total_days}. "
-                f"OMR {spent_so_far:,.0f} spent so far, tracking toward "
-                f"**~OMR {run_rate:,.0f}** by {cycle_dates(live_cycle).split('–')[1].strip()} "
-                f"— OMR {abs(pace):,.0f} {verdict} your usual OMR {cycle_avg:,.0f}. "
-                f"Excluded from every figure below.",
-                icon="⏳",
-            )
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SECTION 1 — LAST COMPLETE CYCLE
-        # ══════════════════════════════════════════════════════════════════════
-        st.subheader(f"Last Complete Cycle — {cycle_label(latest_cycle)}")
-        st.caption(cycle_dates(latest_cycle))
-
-        # ── 4 KPI cards ────────────────────────────────────────────────────────
-        c1, c2, c3, c4 = st.columns(4)
+        # ── Three numbers, and only three ──────────────────────────────────────
+        c1, c2, c3 = st.columns(3)
 
         with c1:
-            # Compared against the 3-cycle average, not the previous cycle:
-            # cycle-to-cycle swing is ~50% here, so "vs last month" is mostly noise.
-            delta_vs_base = (
-                f"{((latest_total - base_avg) / base_avg * 100):+.0f}% vs 3-cycle avg"
-                if base_avg else None
-            )
-            st.metric("Total Spend", f"OMR {latest_total:,.0f}",
-                      delta=delta_vs_base, delta_color="inverse")
-            if base_avg:
-                st.caption(f"3-cycle avg: OMR {base_avg:,.0f}")
+            gap  = spent - usual
+            st.metric("Spent so far" if live else "Total spend", f"OMR {spent:,.0f}",
+                      f"{gap:+,.0f} vs usual" if usual else None,
+                      delta_color="inverse")
 
         with c2:
-            st.metric("Typical Cycle", f"OMR {cycle_avg:,.0f}",
-                      help=f"Mean of {len(done_cycles)} complete billing cycles "
-                           f"(partial cycles excluded)")
-            st.caption(f"Median OMR {monthly_totals[done_cycles].median():,.0f} "
-                       f"· {len(done_cycles)} cycles")
+            st.metric("Usually by now" if live else "Typical cycle",
+                      f"OMR {usual:,.0f}",
+                      help="Median of the same point in every complete cycle")
+            st.caption(f"Normal range OMR {p25:,.0f}–{p75:,.0f}")
 
         with c3:
-            # Recurring baseline — the part of a cycle that is already committed
-            recent_done   = done_cycles[-6:]
-            recent_data   = flt[flt["Month"].isin(recent_done)]
-            recent_total  = recent_data["Amount"].sum()
-            rec_total     = recent_data[recent_data["Type"] == "Recurring"]["Amount"].sum()
-            rec_per_cyc   = rec_total / len(recent_done)
-            rec_pct       = (rec_total / recent_total * 100) if recent_total else 0
-            # Both halves must come from the same window, or they won't add up
-            # to the cycle average the user sees next to them.
-            disc_per_cyc  = (recent_total - rec_total) / len(recent_done)
-            st.metric("Recurring Baseline", f"OMR {rec_per_cyc:,.0f}",
-                      f"{rec_pct:.0f}% of spend", delta_color="off",
-                      help=f"Merchants you pay in most cycles — the part of your "
-                           f"spend that is committed before you decide anything. "
-                           f"Measured over the last {len(recent_done)} complete cycles.")
-            st.caption(f"Discretionary: OMR {disc_per_cyc:,.0f}/cycle")
+            # For a live cycle, judge the PROJECTION, not the raw total — six
+            # days of spending is below the full-cycle band by definition.
+            # Projection scales by how far off the usual pace you are, rather
+            # than extrapolating linearly.
+            projected = (spent / usual * TYPICAL) if (live and usual) else spent
+            verdict = ("below normal" if projected < BAND_LO else
+                       "above normal" if projected > BAND_HI else "within normal")
+            st.metric("Full-cycle range", f"OMR {BAND_LO:,.0f}–{BAND_HI:,.0f}",
+                      help="Middle half of your complete cycles (25th–75th percentile). "
+                           "Only 5 of 17 cycles land near the mean, so a single "
+                           "average is a misleading reference.")
+            st.caption(f"At this pace ≈ OMR {projected:,.0f} — {verdict}" if live
+                       else f"This cycle is {verdict}")
 
-        with c4:
-            cat_totals  = latest_data.groupby("Category")["Amount"].sum()
-            top_cat     = cat_totals.idxmax()
-            top_cat_pct = cat_totals.max() / cat_totals.sum() * 100
-            # Amount as the headline — category names are too long to survive
-            # Streamlit's metric truncation ("Shopping & Retail" → "Shopping …")
-            st.metric("Top Category", f"OMR {cat_totals.max():,.0f}",
-                      f"{top_cat}  ·  {top_cat_pct:.0f}%", delta_color="off")
-
-        # ── What changed, and who drove it ─────────────────────────────────────
-        movers = category_movers(flt, latest_cycle, base_cycles)
-        if not movers.empty:
-            st.markdown("**What moved vs your usual**")
-            mcols = st.columns(len(movers))
-            for col, (_, r) in zip(mcols, movers.iterrows()):
-                # The delta string must start with the signed number — Streamlit
-                # reads that sign to pick the arrow direction and the colour.
-                col.metric(
-                    r["Category"], f"OMR {r['Now']:,.0f}",
-                    f"{r['Change']:+,.0f} vs usual {r['Usual']:,.0f}",
-                    delta_color="inverse",
-                )
-                col.caption(
-                    f"↳ {r['Driver']} ({r['DriverChange']:+,.0f})"
-                    if r["Driver"] != "—" else ""
-                )
-
-        st.divider()
-
-        # ── Category breakdown (latest cycle) + Top transactions ───────────────
-        col_left, col_right = st.columns([1, 1])
-
-        with col_left:
-            st.markdown("**Spend by Category**")
-            cat_df = (
-                latest_data.groupby("Category")["Amount"].sum()
-                .reset_index().sort_values("Amount", ascending=False)
-            )
-            cat_df["Pct"]    = (cat_df["Amount"] / cat_df["Amount"].sum() * 100).round(1)
-            cat_df["_label"] = cat_df.apply(
-                lambda r: f"OMR {int(round(r['Amount'])):,}  ({r['Pct']:.0f}%)", axis=1
-            )
-            cat_df = cat_df.sort_values("Amount", ascending=False)
-
-            fig_cat = px.bar(
-                cat_df, x="Amount", y="Category", orientation="h",
-                color="Category", color_discrete_sequence=COLORS,
-                text="_label", custom_data=["Pct"],
-            )
-            fig_cat.update_traces(
-                textposition="outside",
-                hovertemplate="<b>%{y}</b><br>OMR %{x:,.0f}  (%{customdata[0]}%)<extra></extra>",
-            )
-            fig_cat.update_layout(
-                showlegend=False,
-                xaxis=dict(showticklabels=False, title="",
-                           range=[0, cat_df["Amount"].max() * 1.45]),
-                yaxis_title="",
-                # Top margin keeps the largest bar's label clear of the
-                # Plotly toolbar, which overlays the chart's top-right on hover.
-                margin=dict(t=28, b=0, r=10),
-                height=max(300, len(cat_df) * 36),
-            )
-            st.plotly_chart(fig_cat, width="stretch", config=CHART_CFG)
-
-        with col_right:
-            st.markdown("**Top Transactions**")
-            top_txns = (
-                latest_data.nlargest(12, "Amount")
-                [["Transaction Date", "Merchant", "Amount", "Category"]].copy()
-            )
-            top_txns["Transaction Date"] = top_txns["Transaction Date"].dt.strftime("%d %b")
-            top_txns["Amount"]           = top_txns["Amount"].round(0).astype(int)
-            top_txns = top_txns.rename(columns={
-                "Transaction Date": "Date", "Amount": "OMR",
-            })
-            st.dataframe(top_txns, hide_index=True, width="stretch",
-                         height=max(280, len(cat_df) * 36))
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SECTION 2 — WHAT'S COMMITTED
-        # ══════════════════════════════════════════════════════════════════════
-        st.divider()
-        st.subheader("Committed vs Discretionary")
-        st.caption(
-            f"Based on the last {len(recent_done)} complete cycles. **Recurring** = "
-            f"merchants you pay in at least 4 of the last 6 cycles."
+        # ── Pace bar ───────────────────────────────────────────────────────────
+        fig_pace = go.Figure()
+        fig_pace.add_trace(go.Bar(
+            x=[spent], y=[""], orientation="h", width=0.45,
+            marker_color=RED if spent > (p75 or spent) else TEAL,
+            hovertemplate=f"Spent: OMR {spent:,.0f}<extra></extra>",
+        ))
+        # Annotations sit below the axis — the Plotly toolbar overlays the
+        # top-right of the plot on hover and would cover them.
+        if usual:
+            fig_pace.add_vline(x=usual, line_dash="dot", line_color="#555", line_width=2,
+                               annotation_text="usual by now" if live else "typical",
+                               annotation_position="bottom", annotation_font_color="#555")
+        fig_pace.add_vrect(x0=BAND_LO, x1=BAND_HI, fillcolor="#b0bec5", opacity=0.18,
+                           line_width=0, layer="below",
+                           annotation_text="normal full-cycle range",
+                           annotation_position="bottom", annotation_font_color="#78909c")
+        fig_pace.update_layout(
+            xaxis=dict(title="", tickformat=",d",
+                       range=[0, max(spent, BAND_HI, usual) * 1.12]),
+            yaxis=dict(showticklabels=False),
+            showlegend=False, height=150, margin=dict(t=10, b=55, l=0, r=10),
         )
+        st.plotly_chart(fig_pace, width="stretch", config=CHART_CFG)
 
-        rec_col, list_col = st.columns([2, 3])
+        # ── Everyday vs episodic ───────────────────────────────────────────────
+        kind_now = focus_data.groupby("Kind")["Amount"].sum()
+        k1, k2 = st.columns(2)
+        for col, kind, note in (
+            (k1, "Everyday", "food, groceries, fuel, bills"),
+            (k2, "Episodic", "travel and big one-off purchases"),
+        ):
+            with col:
+                got = float(kind_now.get(kind, 0.0))
+                # Compare like with like: on a live cycle the benchmark is where
+                # this kind of spend normally stands by this same day, not the
+                # full-cycle figure.
+                sub = expenses[expenses["Kind"] == kind]
+                if live:
+                    ref = pace_curve(sub, COMPLETE_CYCLES).get(elapsed, (0, 0, 0))[1]
+                    lbl = "vs usual by now"
+                else:
+                    ref = float(sub[sub["Month"].isin(COMPLETE_CYCLES)]
+                                .groupby("Month")["Amount"].sum().median())
+                    lbl = "vs typical cycle"
+                col.metric(f"{kind} so far" if live else kind, f"OMR {got:,.0f}",
+                           f"{got - ref:+,.0f} {lbl}" if ref else None,
+                           delta_color="inverse")
+                col.caption(note)
 
-        with rec_col:
-            split = (
-                recent_data.groupby("Type")["Amount"].sum()
-                .reindex(["Recurring", "One-off"]).fillna(0) / len(recent_done)
-            )
-            fig_split = go.Figure(go.Bar(
-                x=split.values, y=split.index, orientation="h",
-                marker_color=["#80cbc4", "#c5cae9"],
-                text=[f"OMR {v:,.0f}/cycle" for v in split.values],
-                textposition="outside",
-                hovertemplate="<b>%{y}</b><br>OMR %{x:,.0f} per cycle<extra></extra>",
-            ))
-            fig_split.update_layout(
-                xaxis=dict(showticklabels=False, title="",
-                           range=[0, split.max() * 1.5]),
-                yaxis_title="", margin=dict(t=10, b=0, r=10),
-                height=170, showlegend=False,
-            )
-            st.plotly_chart(fig_split, width="stretch", config=CHART_CFG)
-            st.caption(
-                f"About **OMR {rec_per_cyc:,.0f}** of a typical cycle is spoken for "
-                f"before you make a single choice."
-            )
-
-        with list_col:
-            rec_rows = recent_data[recent_data["Type"] == "Recurring"]
-            if rec_rows.empty:
-                st.info("No recurring merchants detected yet — needs ~6 complete cycles.")
-            else:
-                per_cyc = rec_rows.groupby(["Merchant", "Month"])["Amount"].sum()
-                agg     = per_cyc.groupby("Merchant").agg(
-                    Cycles="count", _mean="mean", _std="std"
-                ).fillna(0)
-                agg["Per Cycle"] = (per_cyc.groupby("Merchant").sum()
-                                    / len(recent_done)).round(1)
-                agg["Pattern"] = (agg["_std"] / agg["_mean"]).apply(
-                    lambda cv: "steady" if cv <= 0.40 else "variable"
-                )
-                agg = (agg[["Per Cycle", "Cycles", "Pattern"]]
-                       .sort_values("Per Cycle", ascending=False)
-                       .reset_index())
-                agg["Cycles"] = agg["Cycles"].astype(int).astype(str) + f"/{len(recent_done)}"
-                agg = agg.rename(columns={"Per Cycle": "OMR / cycle"})
-                st.dataframe(agg, hide_index=True, width="stretch", height=280)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SECTION 3 — SPENDING HISTORY
-        # ══════════════════════════════════════════════════════════════════════
         st.divider()
-        st.subheader("Spending History")
 
-        monthly = monthly_totals.reset_index()
-        monthly.columns     = ["Month", "Amount"]
-        monthly["Label"]    = monthly["Month"].apply(cycle_label)
-        monthly["Complete"] = monthly["Month"].isin(COMPLETE_CYCLES)
-        monthly["AmtText"]  = monthly.apply(
-            lambda r: f"OMR {int(round(r['Amount'])):,}" + ("" if r["Complete"] else " so far"),
-            axis=1,
-        )
+        # ── The items that actually explain the cycle ──────────────────────────
+        # Top 8 covers a median 59% of a cycle; the 12-36 transactions under
+        # OMR 5 together account for only 4-11%.
+        st.markdown("**Biggest items this cycle**")
+        big = focus_data.nlargest(8, "Amount")[
+            ["Transaction Date", "Merchant", "Amount", "Category"]
+        ].copy()
+        if big.empty:
+            st.info("No transactions in this cycle yet.")
+        else:
+            big["Transaction Date"] = big["Transaction Date"].dt.strftime("%d %b")
+            big["Amount"] = big["Amount"].round(0).astype(int)
+            covered = big["Amount"].sum() / spent * 100 if spent else 0
+            st.dataframe(
+                big.rename(columns={"Transaction Date": "Date", "Amount": "OMR"}),
+                hide_index=True, width="stretch",
+                height=38 + len(big) * 35,     # size to content, no filler rows
+            )
+            st.caption(f"These {len(big)} cover {covered:.0f}% of the cycle "
+                       f"({len(focus_data)} transactions in total)")
 
-        # Partial cycles are drawn hollow — present for context, but visibly
-        # not comparable to the complete cycles around them.
-        bar_colors = [
-            ("#ef9a9a" if amt > cycle_avg else "#90caf9") if done else "#e0e0e0"
-            for amt, done in zip(monthly["Amount"], monthly["Complete"])
-        ]
-        bar_lines = ["#bdbdbd" if not done else "rgba(0,0,0,0)" for done in monthly["Complete"]]
-        y_max     = monthly["Amount"].max() * 1.22
+        st.divider()
 
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Bar(
-            x=monthly["Label"], y=monthly["Amount"],
-            marker=dict(color=bar_colors,
-                        line=dict(color=bar_lines, width=1.5)),
-            text=monthly["AmtText"], textposition="outside",
-            name="Cycle spend",
-            customdata=monthly["Complete"].map({True: "complete", False: "partial cycle"}),
+        # ── History with the normal band drawn in ──────────────────────────────
+        st.markdown("**Recent cycles**")
+        hist = cycle_totals.tail(13).reset_index()
+        hist.columns  = ["Month", "Amount"]
+        hist["Label"] = hist["Month"].apply(cycle_label)
+        hist["Done"]  = hist["Month"].isin(COMPLETE_CYCLES)
+
+        fig_h = go.Figure()
+        fig_h.add_hrect(y0=BAND_LO, y1=BAND_HI, fillcolor="#b0bec5", opacity=0.18,
+                        line_width=0, layer="below",
+                        annotation_text="normal range", annotation_position="top left",
+                        annotation_font_color="#78909c")
+        fig_h.add_trace(go.Bar(
+            x=hist["Label"], y=hist["Amount"],
+            marker=dict(
+                color=[(RED if a > BAND_HI else TEAL if a >= BAND_LO else BLUE)
+                       if d else GREY for a, d in zip(hist["Amount"], hist["Done"])],
+                line=dict(color=["rgba(0,0,0,0)" if d else "#bdbdbd" for d in hist["Done"]],
+                          width=1.5),
+            ),
+            text=hist["Amount"].round(0).astype(int).apply(lambda v: f"{v:,}"),
+            textposition="outside",
+            customdata=hist["Done"].map({True: "complete", False: "partial"}),
             hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<br><i>%{customdata}</i><extra></extra>",
         ))
-        fig_trend.add_hline(
-            y=cycle_avg,
-            line_dash="dot", line_color="#555", line_width=2,
-            annotation_text=f"Avg  OMR {cycle_avg:,.0f}",
-            annotation_position="top left",
-            annotation_font_color="#555",
-        )
-        fig_trend.update_layout(
+        fig_h.update_layout(
             xaxis_title="", yaxis_title="OMR",
-            yaxis=dict(tickformat=",d", range=[0, y_max]),
-            showlegend=False,
-            margin=dict(t=20, b=0), height=320,
+            yaxis=dict(tickformat=",d", range=[0, hist["Amount"].max() * 1.25]),
+            showlegend=False, height=300, margin=dict(t=30, b=0),
         )
-        st.plotly_chart(fig_trend, width="stretch", config=CHART_CFG)
-        st.caption(
-            "🔴 Above average  🔵 Below average  ⬜ Partial cycle — excluded from "
-            "the average and every comparison"
-        )
+        st.plotly_chart(fig_h, width="stretch", config=CHART_CFG)
+        st.caption("🔴 above normal   🟢 within normal   🔵 below normal   ⬜ partial cycle")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MONTHLY DEEP-DIVE
+# EXPLAIN — one question: where did the money go, and what changed?
 # ════════════════════════════════════════════════════════════════════════════════
-with t_monthly:
-    if flt.empty:
-        st.warning("No data.")
+with t_explain:
+    if not COMPLETE_CYCLES:
+        st.warning("Need at least one complete billing cycle.")
     else:
-        month_options = sorted(flt["Month"].unique(), reverse=True)
-        # Land on the most recent COMPLETE cycle, not the in-progress one —
-        # otherwise the tab opens on a partial total and a meaningless delta.
-        _default_i = next(
-            (i for i, ym in enumerate(month_options) if ym in COMPLETE_CYCLES), 0
-        )
-        sel_month = st.selectbox(
-            "Select Billing Cycle", month_options, index=_default_i,
-            format_func=lambda ym: cycle_labels_map.get(ym, ym),
-        )
-        st.caption(f"Cycle period: **{cycle_dates(sel_month)}**")
-        m_data = flt[flt["Month"] == sel_month]
+        SCOPES = {"Last 3 cycles": 3, "Last 6 cycles": 6,
+                  "Last 12 cycles": 12, "All": len(COMPLETE_CYCLES)}
+        pick = st.radio("Period", list(SCOPES) + ["One cycle…"],
+                        horizontal=True, label_visibility="collapsed")
 
-        if sel_month not in COMPLETE_CYCLES:
-            if sel_month == INPROGRESS:
-                el, tot = cycle_progress(sel_month)
-                st.info(
-                    f"This cycle is still open — day {el} of {tot}. Totals below are "
-                    f"partial, so comparisons against full cycles will look low.",
-                    icon="⏳",
-                )
-            else:
-                st.info(
-                    "Your data doesn't cover the start of this cycle, so the totals "
-                    "below are incomplete.",
-                    icon="⏳",
-                )
+        if pick == "One cycle…":
+            sel = st.selectbox("Billing cycle", list(reversed(COMPLETE_CYCLES)),
+                               format_func=lambda ym: cycle_labels_map.get(ym, ym))
+            period, base = [sel], []
+            i = COMPLETE_CYCLES.index(sel)
+            base = COMPLETE_CYCLES[max(0, i - 3):i]
+        else:
+            n = min(SCOPES[pick], len(COMPLETE_CYCLES))
+            period = COMPLETE_CYCLES[-n:]
+            base   = COMPLETE_CYCLES[max(0, len(COMPLETE_CYCLES) - 2 * n):-n]
 
-        # Previous billing cycle for deltas
-        idx = month_options.index(sel_month)
-        prev_month = month_options[idx + 1] if idx + 1 < len(month_options) else None
-        prev_data  = flt[flt["Month"] == prev_month] if prev_month else pd.DataFrame()
-
-        total_curr = m_data["Amount"].sum()
-        total_prev = prev_data["Amount"].sum() if not prev_data.empty else None
-        prev_label = cycle_label(prev_month) if prev_month else ""
-        pct_delta  = f"{((total_curr - total_prev) / total_prev * 100):+.0f}% vs {prev_label}" if total_prev else None
-
-        ca, cb, cc, cd = st.columns(4)
-        ca.metric("Total Spend",     f"OMR {total_curr:,.0f}",
-                  delta=pct_delta, delta_color="inverse")
-        cb.metric("Transactions",    len(m_data),
-                  delta=f"{len(m_data) - len(prev_data):+d} vs prev" if not prev_data.empty else None)
-        cc.metric("Avg Transaction", f"OMR {m_data['Amount'].mean():,.0f}")
-        cd.metric("Largest Item",    f"OMR {m_data['Amount'].max():,.0f}")
-
-        st.divider()
-        col1, col2 = st.columns([3, 2])
-
-        with col1:
-            st.subheader("Category Breakdown")
-            cat_m = m_data.groupby("Category")["Amount"].sum().reset_index()
-            st.plotly_chart(
-                hbar(cat_m, "Amount", "Category", height=280),
-                width="stretch", config=CHART_CFG,
-            )
-
-            st.subheader("Cumulative Spend Through Month")
-            cumul = (
-                m_data.sort_values("Transaction Date")
-                .assign(Cumulative=lambda d: d["Amount"].cumsum())
-            )
-            fig_cumul = px.line(
-                cumul, x="Transaction Date", y="Cumulative",
-                markers=True, color_discrete_sequence=["#4a90d9"],
-                custom_data=["Description", "Amount"],
-            )
-            fig_cumul.update_traces(
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>"
-                    "OMR %{customdata[1]:,.0f}<br>"
-                    "Running total: OMR %{y:,.0f}<extra></extra>"
-                ),
-            )
-            fig_cumul.update_layout(
-                xaxis_title="", yaxis_title="Cumulative OMR",
-                yaxis=dict(tickformat=",d"), margin=dict(t=10, b=0), height=240,
-            )
-            st.plotly_chart(fig_cumul, width="stretch", config=CHART_CFG)
-
-        with col2:
-            st.subheader("Top 10 Transactions")
-            top10 = (
-                m_data.nlargest(10, "Amount")
-                [["Transaction Date", "Description", "Amount", "Category"]].copy()
-            )
-            top10["Transaction Date"] = top10["Transaction Date"].dt.strftime("%d %b")
-            top10["Amount"] = top10["Amount"].round(0).astype(int)
-            top10 = top10.rename(columns={"Amount": "OMR", "Transaction Date": "Date"})
-            st.dataframe(top10, hide_index=True, width="stretch", height=280)
-
-            if not prev_data.empty:
-                st.subheader(f"Change vs {cycle_label(prev_month)}")
-                curr_cat = m_data.groupby("Category")["Amount"].sum()
-                prev_cat = prev_data.groupby("Category")["Amount"].sum()
-                cmp = (
-                    pd.DataFrame({"curr": curr_cat, "prev": prev_cat})
-                    .fillna(0)
-                    .assign(Change=lambda d: d["curr"] - d["prev"])
-                    .reset_index()
-                    .sort_values("Change", ascending=False)
-                )
-                cmp["_label"] = cmp["Change"].apply(
-                    lambda v: f"{'+' if v >= 0 else ''}OMR {int(round(v)):,}"
-                )
-
-                # Name the merchant behind each category move — a category delta
-                # on its own never says who caused it.
-                drivers = category_movers(flt, sel_month, [prev_month], top_n=len(cmp))
-                driver_map = dict(zip(drivers["Category"], drivers["Driver"])) if not drivers.empty else {}
-                cmp["Driver"] = cmp["Category"].map(driver_map).fillna("—")
-
-                fig_cmp = px.bar(
-                    cmp, x="Category", y="Change",
-                    color="Change",
-                    color_continuous_scale=["#ef5350", "#ffcc80", "#66bb6a"],
-                    color_continuous_midpoint=0,
-                    text="_label", custom_data=["Driver"],
-                )
-                fig_cmp.update_traces(
-                    textposition="outside",
-                    hovertemplate=(
-                        "<b>%{x}</b><br>Change: OMR %{y:,.0f}"
-                        "<br>Driven by: %{customdata[0]}<extra></extra>"
-                    ),
-                )
-                _cmp_abs = cmp["Change"].abs().max() if not cmp.empty else 1
-                fig_cmp.update_layout(
-                    xaxis_title="", yaxis_title="OMR",
-                    yaxis=dict(tickformat=",d",
-                               range=[-_cmp_abs * 1.35, _cmp_abs * 1.35]),
-                    coloraxis_showscale=False,
-                    xaxis=dict(tickangle=-40),
-                    margin=dict(t=10, b=80), height=320,
-                )
-                st.plotly_chart(fig_cmp, width="stretch", config=CHART_CFG)
-
-        st.subheader("All Transactions This Cycle")
-        show_m = m_data[["Transaction Date", "Description", "City", "Amount", "Category"]].copy()
-        show_m["Transaction Date"] = show_m["Transaction Date"].dt.strftime("%d %b %Y")
-        show_m["Amount"] = show_m["Amount"].round(0).astype(int)
-        show_m = (
-            show_m.rename(columns={"Amount": "OMR Amount"})
-            .sort_values("OMR Amount", ascending=False)
-        )
-        st.dataframe(show_m, hide_index=True, width="stretch")
-
-        # ── Bill Verification ───────────────────────────────────────────────────
-        st.divider()
-        st.subheader("Bill Verification")
+        data  = expenses[expenses["Month"].isin(period)]
+        total = float(data["Amount"].sum())
         st.caption(
-            "Your payment for this cycle should equal the **Cycle Total** above. "
-            "Payments are typically posted in the following cycle."
+            f"{cycle_label(period[0])} – {cycle_label(period[-1])} · "
+            f"{len(period)} cycle(s) · OMR {total:,.0f} total · "
+            f"OMR {total / len(period):,.0f} per cycle · complete cycles only"
         )
 
-        # Build per-cycle reconciliation table
-        cycle_totals = (
-            expenses.groupby("Month")["Amount"].sum()
-            .reset_index().rename(columns={"Month": "Cycle", "Amount": "Expenses (OMR)"})
-            .sort_values("Cycle", ascending=False)
-        )
-        cycle_totals["Period"] = cycle_totals["Cycle"].apply(cycle_label)
-        cycle_totals["Expenses (OMR)"] = cycle_totals["Expenses (OMR)"].round(0).astype(int)
+        # ── What changed, and who caused it ────────────────────────────────────
+        movers = category_movers(expenses, period, base, top_n=3)
+        if not movers.empty:
+            st.markdown(f"**What moved** — vs the previous {len(base)} cycle(s)")
+            mc = st.columns(len(movers))
+            for col, (_, r) in zip(mc, movers.iterrows()):
+                col.metric(r["Category"], f"OMR {r['Now']:,.0f}/cycle",
+                           f"{r['Change']:+,.0f} vs usual {r['Usual']:,.0f}",
+                           delta_color="inverse")
+                if r["Driver"] != "—":
+                    col.caption(f"↳ {r['Driver']} ({r['DriverChange']:+,.0f})")
+            st.divider()
 
-        # Match each payment to the cycle whose end date is just before the payment
+        # ── Where it went ──────────────────────────────────────────────────────
+        left, right = st.columns([1, 1])
+
+        with left:
+            st.markdown("**By category**")
+            cat = (data.groupby("Category")["Amount"].sum()
+                   .reset_index().sort_values("Amount", ascending=False))
+            cat["Pct"] = (cat["Amount"] / cat["Amount"].sum() * 100).round(0)
+            cat["_l"]  = cat.apply(
+                lambda r: f"OMR {int(round(r['Amount'])):,}  ({r['Pct']:.0f}%)", axis=1)
+            # `cat` is already sorted descending, and Plotly lays categorical
+            # rows out top-down, so the largest bar lands at the top.
+            fig_c = px.bar(cat, x="Amount", y="Category", orientation="h",
+                           color="Category", color_discrete_sequence=COLORS,
+                           text="_l", custom_data=["Pct"])
+            fig_c.update_traces(
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>OMR %{x:,.0f} (%{customdata[0]}%)<extra></extra>")
+            fig_c.update_layout(
+                showlegend=False, yaxis_title="",
+                xaxis=dict(showticklabels=False, title="",
+                           range=[0, cat["Amount"].max() * 1.45]),
+                margin=dict(t=28, b=0, r=10), height=max(320, len(cat) * 34),
+            )
+            st.plotly_chart(fig_c, width="stretch", config=CHART_CFG)
+
+        with right:
+            st.markdown("**By merchant**")
+            mer = data.groupby("Merchant").agg(
+                Total=("Amount", "sum"), Txns=("Amount", "count"),
+                Cycles=("Month", "nunique"),
+            ).sort_values("Total", ascending=False).head(15).reset_index()
+            mer["Per cycle"] = (mer["Total"] / len(period)).round(1)
+            mer["Total"]     = mer["Total"].round(0).astype(int)
+            mer["Seen in"]   = mer["Cycles"].astype(str) + f"/{len(period)}"
+            st.dataframe(
+                mer[["Merchant", "Total", "Per cycle", "Txns", "Seen in"]]
+                   .rename(columns={"Total": "Total OMR", "Per cycle": "OMR / cycle"}),
+                hide_index=True, width="stretch", height=max(320, len(cat) * 34),
+            )
+
+        st.divider()
+
+        # ── Drill into one category ────────────────────────────────────────────
+        st.markdown("**Drill into a category**")
+        cats = cat["Category"].tolist()
+        dcat = st.selectbox("Category", cats, label_visibility="collapsed")
+        dd   = data[data["Category"] == dcat]
+
+        d1, d2 = st.columns([2, 3])
+        with d1:
+            dm = (dd.groupby("Merchant")["Amount"].sum()
+                  .round(0).astype(int).reset_index()
+                  .sort_values("Amount", ascending=False))
+            if len(dm) > 1:
+                fig_p = px.pie(dm.head(10), values="Amount", names="Merchant",
+                               color_discrete_sequence=COLORS, hole=0.4)
+                fig_p.update_traces(
+                    textinfo="percent", textposition="inside",
+                    hovertemplate="<b>%{label}</b><br>OMR %{value:,}<br>%{percent}<extra></extra>")
+                fig_p.update_layout(margin=dict(t=10, b=0), height=300,
+                                    legend=dict(font=dict(size=10)))
+                st.plotly_chart(fig_p, width="stretch", config=CHART_CFG)
+            else:
+                st.info("Only one merchant in this category.")
+        with d2:
+            dt = dd[["Transaction Date", "Merchant", "Amount", "Month"]].copy()
+            dt["Date"]  = dt["Transaction Date"].dt.strftime("%d %b %Y")
+            dt["OMR"]   = dt["Amount"].round(0).astype(int)
+            dt["Cycle"] = dt["Month"].apply(cycle_label)
+            st.dataframe(dt[["Date", "Cycle", "Merchant", "OMR"]]
+                         .sort_values("OMR", ascending=False),
+                         hide_index=True, width="stretch", height=300)
+            st.caption(f"{len(dd)} transaction(s) · OMR {dd['Amount'].sum():,.0f}")
+
+        st.divider()
+
+        # ── Find a transaction ─────────────────────────────────────────────────
+        st.markdown("**Find a transaction**")
+        q = st.text_input("Search", placeholder="e.g. lulu spar — space or comma separates terms",
+                          label_visibility="collapsed")
+        found = data
+        if q:
+            terms = [t.strip().upper() for t in q.replace(",", " ").split() if t.strip()]
+            hay   = (data["Description"].str.upper() + " " + data["Merchant"].str.upper())
+            found = data[hay.apply(lambda d: any(t in d for t in terms))]
+
+            if not found.empty:
+                fm = found.groupby("Month")["Amount"].sum().reset_index()
+                fm["Label"] = fm["Month"].apply(cycle_label)
+                fig_f = go.Figure(go.Bar(
+                    x=fm["Label"], y=fm["Amount"], marker_color=TEAL,
+                    text=fm["Amount"].round(0).astype(int).apply(lambda v: f"{v:,}"),
+                    textposition="outside",
+                    hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<extra></extra>"))
+                fig_f.update_layout(
+                    title=f'Monthly spend — {" / ".join(terms)}',
+                    xaxis_title="", yaxis_title="OMR",
+                    yaxis=dict(tickformat=",d", range=[0, fm["Amount"].max() * 1.25]),
+                    showlegend=False, height=260, margin=dict(t=50, b=0))
+                st.plotly_chart(fig_f, width="stretch", config=CHART_CFG)
+
+        show = found[["Transaction Date", "Merchant", "Description", "City",
+                      "TXN Currency", "TXN Amount", "Amount", "Category"]].copy()
+        show["_key"] = row_key(found).values
+        show = show.sort_values("Transaction Date", ascending=False).reset_index(drop=True)
+        show.insert(0, "Delete", False)
+        show["Amount"] = show["Amount"].round(0).astype(int)
+        show = show.rename(columns={"Amount": "OMR"})
+        show["Transaction Date"] = show["Transaction Date"].dt.strftime("%d %b %Y")
+
+        edited = st.data_editor(
+            show.drop(columns=["_key"]),
+            column_config={"Delete": st.column_config.CheckboxColumn(
+                "🗑️", help="Check rows to delete, then click Delete")},
+            disabled=[c for c in show.columns if c not in ["Delete", "_key"]],
+            hide_index=True, width="stretch", key="txn_editor",
+        )
+        st.caption(f"{len(show)} transaction(s)")
+
+        n_sel = int(edited["Delete"].sum())
+        b1, b2 = st.columns([2, 5])
+        with b1:
+            if st.button(f"Delete {n_sel} transaction{'s' if n_sel != 1 else ''}",
+                         type="primary", disabled=(n_sel == 0)):
+                delete_rows(show.loc[edited["Delete"].values, "_key"].tolist())
+                st.success(f"Deleted {n_sel} transaction(s).")
+                st.rerun()
+        with b2:
+            st.download_button("Export CSV",
+                               show.drop(columns=["_key", "Delete"]).to_csv(index=False),
+                               "expenses.csv", "text/csv")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# REVIEW — the few-times-a-year work
+# ════════════════════════════════════════════════════════════════════════════════
+with t_review:
+    # ── Trips ──────────────────────────────────────────────────────────────────
+    st.subheader("Trips")
+    st.caption(
+        "Detected from clusters of foreign-currency spend. Cost counts **everything** "
+        "charged during the trip window, not just the Travel category — meals and "
+        "shopping abroad belong to the trip."
+    )
+    trips = detect_trips(expenses)
+    if not trips:
+        st.info("No trips detected.")
+    else:
+        td = pd.DataFrame(trips)
+        td["When"]    = (td["Start"].dt.strftime("%d %b %Y") + " – "
+                         + td["End"].dt.strftime("%d %b %Y"))
+        td["Cost"]    = td["Total"].round(0).astype(int)
+        td["Per day"] = td["PerDay"].round(0).astype(int)
+
+        tl, tr = st.columns([3, 2])
+        with tl:
+            st.dataframe(td[["Trip", "When", "Days", "Cost", "Per day", "Txns"]]
+                         .rename(columns={"Cost": "Total OMR", "Per day": "OMR / day"}),
+                         hide_index=True, width="stretch",
+                         height=38 + len(td) * 35)
+        with tr:
+            # Chart is dated-only on the axis; full destinations live in the
+            # table beside it, so long country lists cannot squeeze the bars.
+            fig_t = go.Figure(go.Bar(
+                x=td["Total"][::-1], y=td["Start"].dt.strftime("%b %Y")[::-1],
+                orientation="h", marker_color=TEAL,
+                customdata=td["Trip"][::-1],
+                text=td["Cost"][::-1].apply(lambda v: f"OMR {v:,}"), textposition="outside",
+                hovertemplate="<b>%{customdata}</b><br>%{y}<br>OMR %{x:,.0f}<extra></extra>"))
+            fig_t.update_layout(
+                xaxis=dict(showticklabels=False, title="",
+                           range=[0, td["Total"].max() * 1.45]),
+                yaxis=dict(title="", type="category"),
+                height=58 + len(td) * 35, margin=dict(t=30, b=0, r=10),
+                showlegend=False)
+            st.plotly_chart(fig_t, width="stretch", config=CHART_CFG)
+        st.caption(f"Total across {len(td)} trip(s): **OMR {td['Total'].sum():,.0f}** "
+                   f"— {td['Total'].sum() / expenses['Amount'].sum() * 100:.0f}% of all spend.")
+
+    st.divider()
+
+    # ── Bill verification ──────────────────────────────────────────────────────
+    st.subheader("Bill Verification")
+    st.caption("Each cycle's expenses against the payment that settled it. "
+               "Payments post in the following cycle.")
+
+    ct = (expenses.groupby("Month")["Amount"].sum().reset_index()
+          .rename(columns={"Month": "Cycle", "Amount": "Expenses (OMR)"})
+          .sort_values("Cycle", ascending=False))
+    ct["Period"] = ct["Cycle"].apply(cycle_label)
+    ct["Expenses (OMR)"] = ct["Expenses (OMR)"].round(0).astype(int)
+
+    if payments.empty:
+        st.info("No payment transactions found yet.")
+    else:
         def payment_cycle(pay_date):
-            """Find which billing cycle this payment most likely settles."""
-            for ym in sorted(cycle_totals["Cycle"].tolist(), reverse=True):
+            for ym in sorted(ct["Cycle"].tolist(), reverse=True):
                 if pay_date >= cycle_end(ym):
                     return ym
             return None
 
-        if not payments.empty:
-            pay_summary = (
-                payments[["Transaction Date", "Amount"]]
-                .copy()
-                .sort_values("Transaction Date", ascending=False)
-            )
-            pay_summary["Settles Cycle"] = pay_summary["Transaction Date"].apply(payment_cycle)
-            pay_by_cycle = (
-                pay_summary.groupby("Settles Cycle")["Amount"]
-                .sum().reset_index()
-                .rename(columns={"Settles Cycle": "Cycle", "Amount": "Payment (OMR)"})
-            )
-            pay_by_cycle["Payment (OMR)"] = pay_by_cycle["Payment (OMR)"].round(0).astype(int)
+        ps = payments[["Transaction Date", "Amount"]].copy()
+        ps["Settles"] = ps["Transaction Date"].apply(payment_cycle)
+        pb = (ps.groupby("Settles")["Amount"].sum().reset_index()
+              .rename(columns={"Settles": "Cycle", "Amount": "Payment (OMR)"}))
+        pb["Payment (OMR)"] = pb["Payment (OMR)"].round(0).astype(int)
 
-            recon = cycle_totals.merge(pay_by_cycle, on="Cycle", how="left")
-            recon["Payment (OMR)"] = recon["Payment (OMR)"].fillna(0).astype(int)
-            recon["Difference"] = recon["Payment (OMR)"] - recon["Expenses (OMR)"]
-            recon = recon[["Period", "Expenses (OMR)", "Payment (OMR)", "Difference"]]
+        recon = ct.merge(pb, on="Cycle", how="left")
+        recon["Payment (OMR)"] = recon["Payment (OMR)"].fillna(0).astype(int)
+        recon["Difference"]    = recon["Payment (OMR)"] - recon["Expenses (OMR)"]
+        recon = recon[["Period", "Expenses (OMR)", "Payment (OMR)", "Difference"]]
 
-            st.dataframe(
-                recon.style.map(
-                    lambda v: "color: green" if v == 0 else ("color: red" if isinstance(v, (int, float)) and v != 0 else ""),
-                    subset=["Difference"],
-                ),
-                hide_index=True, width="stretch",
-            )
-            st.caption(
-                "Difference = Payment − Expenses. "
-                "Zero means the payment exactly matched the bill. "
-                "Negative means underpayment, positive means overpayment or credit."
-            )
-        else:
-            st.info("No payment transactions found in the data yet.")
+        st.dataframe(
+            recon.style.map(
+                lambda v: "color: green" if v == 0 else
+                          ("color: red" if isinstance(v, (int, float)) and v != 0 else ""),
+                subset=["Difference"]),
+            hide_index=True, width="stretch", height=300,
+        )
+        st.caption("Difference = Payment − Expenses. Negative means underpayment, "
+                   "positive means overpayment or credit.")
 
+    st.divider()
 
-# ════════════════════════════════════════════════════════════════════════════════
-# TRENDS
-# ════════════════════════════════════════════════════════════════════════════════
-with t_trends:
-    if flt.empty:
-        st.warning("No data.")
-    elif len(flt["Month"].unique()) < 2:
-        st.info("Upload at least 2 months of data to see trends.")
+    # ── Recurring merchants ────────────────────────────────────────────────────
+    st.subheader("Recurring Merchants")
+    recent_done = COMPLETE_CYCLES[-6:]
+    rd = expenses[expenses["Month"].isin(recent_done) & (expenses["Type"] == "Recurring")]
+    if rd.empty or not recent_done:
+        st.info("Needs about six complete cycles before this is meaningful.")
     else:
-        trend_cat = flt.groupby(["Month", "Category"])["Amount"].sum().reset_index()
-        trend_cat["Label"] = trend_cat["Month"].apply(cycle_label)
-
-        # ── Section 1: Category Deep Dive (select + drill-down) ────────────────
-        st.subheader("Category Deep Dive")
-        cat_options = sorted(flt["Category"].unique())
-        sel_cat = st.selectbox("Select category to explore", cat_options, key="trends_cat")
-
-        cat_data    = flt[flt["Category"] == sel_cat]
-        cat_monthly = cat_data.groupby("Month")["Amount"].sum().reset_index()
-        cat_monthly["Label"]    = cat_monthly["Month"].apply(cycle_label)
-        cat_monthly["Complete"] = cat_monthly["Month"].isin(COMPLETE_CYCLES)
-        cat_monthly["AmtText"]  = cat_monthly["Amount"].round(0).astype(int).apply(lambda v: f"OMR {v:,}")
-
-        # Average over complete cycles only — a partial cycle would drag it down
-        _done = cat_monthly[cat_monthly["Complete"]]
-        cat_avg = _done["Amount"].mean() if not _done.empty else cat_monthly["Amount"].mean()
-
-        fig_cat_trend = go.Figure()
-        fig_cat_trend.add_trace(go.Bar(
-            x=cat_monthly["Label"], y=cat_monthly["Amount"],
-            text=cat_monthly["AmtText"], textposition="outside",
-            marker=dict(
-                color=["#90caf9" if c else "#e0e0e0" for c in cat_monthly["Complete"]],
-                line=dict(color=["rgba(0,0,0,0)" if c else "#bdbdbd"
-                                 for c in cat_monthly["Complete"]], width=1.5),
-            ),
-            customdata=cat_monthly["Complete"].map({True: "complete", False: "partial cycle"}),
-            hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<br><i>%{customdata}</i><extra></extra>",
-        ))
-        fig_cat_trend.add_hline(
-            y=cat_avg, line_dash="dot", line_color="#555", line_width=1.5,
-            annotation_text=f"Avg  OMR {cat_avg:,.0f}",
-            annotation_position="top left", annotation_font_color="#555",
-        )
-        fig_cat_trend.update_layout(
-            xaxis_title="", yaxis_title="OMR",
-            yaxis=dict(tickformat=",d",
-                       range=[0, cat_monthly["Amount"].max() * 1.22]),
-            showlegend=False,
-            margin=dict(t=20, b=0), height=280,
-        )
-        st.plotly_chart(fig_cat_trend, width="stretch", config=CHART_CFG)
-
-        # Drill-down: pick one or more billing cycles → see every transaction
-        st.subheader(f"Transaction Breakdown — {sel_cat}")
-        drill_cycles = sorted(cat_monthly["Month"].tolist(), reverse=True)
-        drill_labels_map = {ym: cycle_label(ym) for ym in drill_cycles}
-        sel_drill = st.multiselect(
-            "Select billing cycle(s)",
-            drill_cycles,
-            default=[drill_cycles[0]] if drill_cycles else [],
-            format_func=lambda ym: drill_labels_map.get(ym, ym),
-            key="trends_drill",
-        )
-
-        if not sel_drill:
-            st.info("Select at least one billing cycle above.")
-        else:
-            drill_src  = cat_data[cat_data["Month"].isin(sel_drill)]
-            drill_txns = drill_src[
-                ["Transaction Date", "Month", "Merchant", "Description", "City", "Amount"]
-            ].copy()
-            drill_txns["Date"]  = drill_txns["Transaction Date"].dt.strftime("%d %b %Y")
-            drill_txns["OMR"]   = drill_txns["Amount"].round(0).astype(int)
-            drill_txns["Cycle"] = drill_txns["Month"].apply(cycle_label)
-            drill_txns = drill_txns[["Date", "Cycle", "Merchant", "Description", "City", "OMR"]]
-            drill_txns = drill_txns.sort_values("OMR", ascending=False)
-
-            col_tbl, col_chart = st.columns([3, 2])
-            with col_tbl:
-                total_drill = drill_txns["OMR"].sum()
-                st.caption(
-                    f"{len(drill_txns)} transaction(s) · OMR {total_drill:,} total · "
-                    f"{drill_txns['Merchant'].nunique()} merchant(s)"
-                )
-                st.dataframe(drill_txns, hide_index=True, width="stretch")
-            with col_chart:
-                # Grouped by normalised merchant, so the same shop doesn't get
-                # split across several slices by its bank description variants.
-                merch = (
-                    drill_src.groupby("Merchant")["Amount"].sum()
-                    .round(0).astype(int).reset_index()
-                    .sort_values("Amount", ascending=False)
-                )
-                if len(merch) > 1:
-                    fig_pie = px.pie(
-                        merch, values="Amount", names="Merchant",
-                        color_discrete_sequence=COLORS, hole=0.35,
-                    )
-                    fig_pie.update_traces(
-                        textinfo="percent", textposition="inside",
-                        hovertemplate="<b>%{label}</b><br>OMR %{value:,}<br>%{percent}<extra></extra>",
-                    )
-                    fig_pie.update_layout(showlegend=True, margin=dict(t=10, b=0), height=260)
-                    st.plotly_chart(fig_pie, width="stretch", config=CHART_CFG)
-
-        st.divider()
-
-        # ── Section 2: Merchants ───────────────────────────────────────────────
-        st.subheader("Merchants")
+        pc  = rd.groupby(["Merchant", "Month"])["Amount"].sum()
+        agg = pc.groupby("Merchant").agg(Cycles="count", _m="mean", _s="std").fillna(0)
+        agg["Per cycle"] = (pc.groupby("Merchant").sum() / len(recent_done)).round(1)
+        agg["Pattern"]   = (agg["_s"] / agg["_m"]).apply(
+            lambda cv: "steady" if cv <= 0.40 else "variable")
+        agg = (agg[["Per cycle", "Cycles", "Pattern"]]
+               .sort_values("Per cycle", ascending=False).reset_index())
+        agg["Cycles"] = agg["Cycles"].astype(int).astype(str) + f"/{len(recent_done)}"
+        st.dataframe(agg.rename(columns={"Per cycle": "OMR / cycle"}),
+                     hide_index=True, width="stretch", height=280)
         st.caption(
-            "Bank descriptions are collapsed to one name per merchant — petrol "
-            "stations, order references and gateway prefixes are stripped."
+            f"OMR {agg['OMR / cycle'].sum() if 'OMR / cycle' in agg else 0:,.0f} — "
+            "seen in at least 4 of the last 6 cycles. Note most of these are "
+            "**variable** (groceries, fuel): predictable that you'll spend, not how much."
         )
 
-        done_flt = [c for c in sorted(flt["Month"].unique()) if c in COMPLETE_CYCLES]
-        m_src    = flt[flt["Month"].isin(done_flt)] if done_flt else flt
-        n_cyc    = max(len(done_flt), 1)
+    st.divider()
 
-        col_top, col_chg = st.columns([3, 2])
-
-        with col_top:
-            st.markdown("**Where the money actually goes**")
-            lead = m_src.groupby("Merchant").agg(
-                Total=("Amount", "sum"),
-                Txns=("Amount", "count"),
-                Cycles=("Month", "nunique"),
-            ).sort_values("Total", ascending=False).head(15).reset_index()
-            lead["Per Cycle"] = (lead["Total"] / n_cyc).round(1)
-            lead["Total"]     = lead["Total"].round(0).astype(int)
-            lead["Seen in"]   = lead["Cycles"].astype(str) + f"/{n_cyc}"
-            lead = lead[["Merchant", "Total", "Per Cycle", "Txns", "Seen in"]]
-            lead = lead.rename(columns={"Total": "Total OMR", "Per Cycle": "OMR / cycle"})
-            st.dataframe(lead, hide_index=True, width="stretch", height=380)
-
-        with col_chg:
-            # New vs lapsed: a merchant that quietly stops billing you (or quietly
-            # starts) is invisible in any category-level view.
-            st.markdown("**Started & stopped**")
-            if len(done_flt) < 4:
-                st.info("Needs at least 4 complete cycles.")
-            else:
-                recent_w = done_flt[-3:]
-                prior_w  = done_flt[:-3]
-                recent_m = set(m_src[m_src["Month"].isin(recent_w)]["Merchant"])
-                prior_m  = set(m_src[m_src["Month"].isin(prior_w)]["Merchant"])
-
-                started = m_src[
-                    m_src["Merchant"].isin(recent_m - prior_m)
-                    & m_src["Month"].isin(recent_w)
-                ].groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head(6)
-
-                # Only flag a lapse for merchants that were an established habit
-                established = (
-                    m_src[m_src["Month"].isin(prior_w)]
-                    .groupby("Merchant")["Month"].nunique()
-                )
-                lapsed_names = [
-                    m for m in (prior_m - recent_m)
-                    if established.get(m, 0) >= max(3, len(prior_w) // 3)
-                ]
-                lapsed = (
-                    m_src[m_src["Merchant"].isin(lapsed_names)]
-                    .groupby("Merchant")["Amount"].sum()
-                    .sort_values(ascending=False).head(6)
-                )
-
-                st.caption(f"Comparing last 3 cycles vs the {len(prior_w)} before")
-                if not started.empty:
-                    st.markdown("🆕 **New**")
-                    for m, v in started.items():
-                        st.markdown(f"<small>{m} — OMR {v:,.0f}</small>",
-                                    unsafe_allow_html=True)
-                if not lapsed.empty:
-                    st.markdown("🛑 **Stopped**")
-                    for m, v in lapsed.items():
-                        last_seen = m_src[m_src["Merchant"] == m]["Month"].max()
-                        st.markdown(
-                            f"<small>{m} — was OMR {v:,.0f}, last seen "
-                            f"{cycle_label(last_seen)}</small>",
-                            unsafe_allow_html=True,
-                        )
-                if started.empty and lapsed.empty:
-                    st.info("No merchants started or stopped recently.")
-
-        st.divider()
-
-        # ── Section 3: Monthly total + 3-cycle rolling average ─────────────────
-        col_a, col_b = st.columns([3, 2])
-
-        with col_a:
-            st.subheader("All Categories — Monthly Total & 3-Cycle Rolling Avg")
-            monthly = flt.groupby("Month")["Amount"].sum().reset_index()
-            monthly["Label"]    = monthly["Month"].apply(cycle_label)
-            monthly["Complete"] = monthly["Month"].isin(COMPLETE_CYCLES)
-
-            # The rolling average is computed over complete cycles only and left
-            # blank on partial ones — otherwise a half-finished cycle drags the
-            # trend line into a fake decline.
-            _series = monthly["Amount"].where(monthly["Complete"])
-            monthly["Rolling3"] = (
-                _series.rolling(3, min_periods=1).mean().where(monthly["Complete"])
-            )
-
-            fig_roll = go.Figure()
-            fig_roll.add_trace(go.Bar(
-                x=monthly["Label"], y=monthly["Amount"],
-                name="Monthly Total",
-                marker=dict(
-                    color=["#90caf9" if c else "#e0e0e0" for c in monthly["Complete"]],
-                    line=dict(color=["rgba(0,0,0,0)" if c else "#bdbdbd"
-                                     for c in monthly["Complete"]], width=1.5),
-                ),
-                customdata=monthly["Complete"].map({True: "complete", False: "partial cycle"}),
-                hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<br><i>%{customdata}</i><extra></extra>",
-            ))
-            fig_roll.add_trace(go.Scatter(
-                x=monthly["Label"], y=monthly["Rolling3"],
-                mode="lines+markers", name="3-Cycle Avg",
-                line=dict(color="#e65100", width=2), marker=dict(size=6),
-                connectgaps=False,
-                hovertemplate="3-Cycle Avg: OMR %{y:,.0f}<extra></extra>",
-            ))
-            fig_roll.update_layout(
-                xaxis_title="", yaxis_title="OMR",
-                yaxis=dict(tickformat=",d"), legend_title="",
-                margin=dict(t=10, b=0), height=300,
-            )
-            st.plotly_chart(fig_roll, width="stretch", config=CHART_CFG)
-
-        with col_b:
-            st.subheader("Cycle Totals")
-            monthly_show = monthly[["Label", "Amount", "Rolling3", "Complete"]].copy()
-            monthly_show["Amount"]   = monthly_show["Amount"].round(0).astype(int)
-            monthly_show["Rolling3"] = monthly_show["Rolling3"].apply(
-                lambda v: "—" if pd.isna(v) else f"{v:,.0f}"
-            )
-            monthly_show["Label"]    = monthly_show.apply(
-                lambda r: r["Label"] if r["Complete"] else f"{r['Label']} (partial)", axis=1
-            )
-            monthly_show = monthly_show.drop(columns=["Complete"]).rename(
-                columns={"Label": "Cycle", "Amount": "Total (OMR)", "Rolling3": "3-Cycle Avg"}
-            ).iloc[::-1].reset_index(drop=True)
-            st.dataframe(monthly_show, hide_index=True, width="stretch", height=300)
-
-        st.divider()
-
-        # ── Section 4: Category mix (% stacked) ────────────────────────────────
-        st.subheader("Category Mix Over Time (% of Monthly Spend)")
-        # Partial cycles are dropped entirely here: in a proportional view a
-        # cycle with two transactions reads as "100% Groceries", which is noise
-        # rather than a shift in habits.
-        trend_cat_done = trend_cat[trend_cat["Month"].isin(COMPLETE_CYCLES)]
-        if trend_cat_done.empty:
-            st.info("No complete billing cycles in the current filter.")
-        else:
-            st.caption("Complete billing cycles only.")
-
-            # Pre-compute % so hovertemplate can show the correct normalised value
-            trend_cat_pct = trend_cat_done.copy()
-            month_totals  = trend_cat_pct.groupby("Month")["Amount"].transform("sum")
-            trend_cat_pct["Pct"] = (trend_cat_pct["Amount"] / month_totals * 100).round(1)
-            fig_pct = px.bar(
-                trend_cat_pct, x="Label", y="Amount", color="Category",
-                color_discrete_sequence=COLORS,
-                custom_data=["Pct"],
-            )
-            fig_pct.update_traces(
-                hovertemplate="<b>%{fullData.name}</b><br>%{x}<br>%{customdata[0]:.1f}%<extra></extra>",
-            )
-            fig_pct.update_layout(
-                barnorm="percent",
-                xaxis_title="", yaxis_title="% of Spend",
-                legend_title="", margin=dict(t=10, b=0), height=320,
-            )
-            st.plotly_chart(fig_pct, width="stretch", config=CHART_CFG)
-
-        # ── Section 5: Year-over-Year (only if multiple years) ─────────────────
-        years = sorted(flt["Year"].unique())
-        if len(years) > 1:
-            st.divider()
-            st.subheader("Year-over-Year Summary")
-            yoy_cat = flt.groupby(["Year", "Category"])["Amount"].sum().reset_index()
-            fig_yoy = px.bar(
-                yoy_cat, x="Category", y="Amount", color="Year",
-                barmode="group", color_discrete_sequence=["#42a5f5", "#ef5350", "#66bb6a"],
-            )
-            fig_yoy.update_traces(
-                hovertemplate="<b>%{x}</b><br>%{fullData.name}<br>OMR %{y:,.0f}<extra></extra>",
-            )
-            fig_yoy.update_layout(
-                xaxis_title="", yaxis_title="OMR",
-                yaxis=dict(tickformat=",d",
-                           range=[0, yoy_cat["Amount"].max() * 1.12]),
-                legend_title="Year",
-                xaxis=dict(tickangle=-30),
-                margin=dict(t=10, b=80), height=380,
-            )
-            st.plotly_chart(fig_yoy, width="stretch", config=CHART_CFG)
-
-            # Summary table
-            yoy_total = flt.groupby("Year")["Amount"].agg(
-                Total="sum", Transactions="count", Avg_Month=lambda x: x.sum() / flt.loc[x.index, "Month"].nunique()
-            ).reset_index()
-            yoy_total["Total"] = yoy_total["Total"].round(0).astype(int)
-            yoy_total["Avg_Month"] = yoy_total["Avg_Month"].round(0).astype(int)
-            yoy_total.columns = ["Year", "Total Spend (OMR)", "Transactions", "Avg/Month (OMR)"]
-            st.dataframe(yoy_total, hide_index=True, width="stretch")
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TRAVEL ANALYSIS
-# ════════════════════════════════════════════════════════════════════════════════
-with t_travel:
-    travel_cat = "Travel & Transport"
-
-    # Cycles that contain any Travel & Transport spend (using full expenses, not flt)
-    travel_cycles = sorted(
-        expenses[expenses["Category"] == travel_cat]["Month"].unique()
-    )
-
-    if not travel_cycles:
-        st.info("No Travel & Transport transactions found. "
-                "Upload more statements or check the Reclassify tab.")
+    # ── Started & stopped ──────────────────────────────────────────────────────
+    st.subheader("Started & Stopped")
+    if len(COMPLETE_CYCLES) < 4:
+        st.info("Needs at least four complete cycles.")
     else:
-        # Default to most recent travel cycle
-        default_idx = len(travel_cycles) - 1
-        sel_travel_cycle = st.selectbox(
-            "Select billing cycle",
-            travel_cycles,
-            index=default_idx,
-            format_func=lambda ym: f"{cycle_label(ym)}  ({cycle_dates(ym)})",
-            key="travel_cycle_sel",
-        )
+        recent_w, prior_w = COMPLETE_CYCLES[-3:], COMPLETE_CYCLES[:-3]
+        src = expenses[expenses["Month"].isin(COMPLETE_CYCLES)]
+        recent_m = set(src[src["Month"].isin(recent_w)]["Merchant"])
+        prior_m  = set(src[src["Month"].isin(prior_w)]["Merchant"])
 
-        # All expenses for selected cycle (unfiltered by sidebar category — we want full picture)
-        cycle_all = expenses[expenses["Month"] == sel_travel_cycle].copy()
-        cycle_travel = cycle_all[cycle_all["Category"] == travel_cat].copy()
-        cycle_other  = cycle_all[cycle_all["Category"] != travel_cat]
+        started = (src[src["Merchant"].isin(recent_m - prior_m) & src["Month"].isin(recent_w)]
+                   .groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head(8))
+        established = src[src["Month"].isin(prior_w)].groupby("Merchant")["Month"].nunique()
+        lapsed_names = [m for m in (prior_m - recent_m)
+                        if established.get(m, 0) >= max(3, len(prior_w) // 3)]
+        lapsed = (src[src["Merchant"].isin(lapsed_names)].groupby("Merchant")["Amount"].sum()
+                  .sort_values(ascending=False).head(8))
 
-        total_cycle   = cycle_all["Amount"].sum()
-        total_travel  = cycle_travel["Amount"].sum()
-        total_other   = cycle_other["Amount"].sum()
+        s1, s2 = st.columns(2)
+        with s1:
+            st.markdown("🆕 **Started** — new in the last 3 cycles")
+            if started.empty:
+                st.caption("Nothing new.")
+            for m, v in started.items():
+                st.markdown(f"<small>{m} — OMR {v:,.0f}</small>", unsafe_allow_html=True)
+        with s2:
+            st.markdown("🛑 **Stopped** — was a habit, now gone")
+            if lapsed.empty:
+                st.caption("Nothing stopped.")
+            for m, v in lapsed.items():
+                last = src[src["Merchant"] == m]["Month"].max()
+                st.markdown(f"<small>{m} — was OMR {v:,.0f}, last seen "
+                            f"{cycle_label(last)}</small>", unsafe_allow_html=True)
 
-        # ── KPI row ────────────────────────────────────────────────────────────
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total Cycle Spend",      f"OMR {total_cycle:,.0f}")
-        k2.metric("Travel & Transport",     f"OMR {total_travel:,.0f}",
-                  f"{total_travel / total_cycle * 100:.0f}% of cycle" if total_cycle else None)
-        k3.metric("All Other Categories",   f"OMR {total_other:,.0f}")
-        k4.metric("Travel Transactions",    f"{len(cycle_travel)}")
+    st.divider()
 
-        st.divider()
+    # ── Full history ───────────────────────────────────────────────────────────
+    st.subheader("Full History")
+    fh = cycle_totals.reset_index()
+    fh.columns  = ["Month", "Amount"]
+    fh["Label"] = fh["Month"].apply(cycle_label)
+    fh["Done"]  = fh["Month"].isin(COMPLETE_CYCLES)
+    fh["R3"]    = (fh["Amount"].where(fh["Done"]).rolling(3, min_periods=1)
+                   .mean().where(fh["Done"]))
 
-        # ── Two columns: full category breakdown + travel sub-categories ───────
-        col_a, col_b = st.columns([1, 1])
-
-        with col_a:
-            st.subheader("Full Spend by Category")
-            cat_breakdown = (
-                cycle_all.groupby("Category")["Amount"].sum()
-                .reset_index().sort_values("Amount", ascending=True)
-            )
-            cat_breakdown["_label"] = (
-                cat_breakdown["Amount"].round(0).astype(int).apply(lambda v: f"OMR {v:,}")
-            )
-            # Highlight travel category
-            cat_breakdown["_color"] = cat_breakdown["Category"].apply(
-                lambda c: "#ef9a9a" if c == travel_cat else "#90caf9"
-            )
-            fig_cat = go.Figure(go.Bar(
-                x=cat_breakdown["Amount"],
-                y=cat_breakdown["Category"],
-                orientation="h",
-                marker_color=cat_breakdown["_color"],
-                text=cat_breakdown["_label"],
-                textposition="outside",
-                hovertemplate="<b>%{y}</b><br>OMR %{x:,.0f}<extra></extra>",
-            ))
-            fig_cat.update_layout(
-                xaxis_title="", yaxis_title="",
-                xaxis=dict(showticklabels=False,
-                           range=[0, cat_breakdown["Amount"].max() * 1.35]),
-                margin=dict(t=10, b=0, r=10), height=320,
-                showlegend=False,
-            )
-            st.plotly_chart(fig_cat, width="stretch", config=CHART_CFG)
-            st.caption(f"🔴 Travel & Transport  🔵 Other categories")
-
-        with col_b:
-            st.subheader("Travel Breakdown")
-            if cycle_travel.empty:
-                st.info("No Travel & Transport spend in this cycle.")
-            else:
-                cycle_travel = cycle_travel.copy()
-                cycle_travel["SubCategory"] = cycle_travel["Description"].apply(travel_subcat)
-                sub_df = (
-                    cycle_travel.groupby("SubCategory")["Amount"].sum()
-                    .reset_index().sort_values("Amount", ascending=True)
-                )
-                sub_df["_label"] = (
-                    sub_df["Amount"].round(0).astype(int).apply(lambda v: f"OMR {v:,}")
-                )
-                fig_sub = go.Figure(go.Bar(
-                    x=sub_df["Amount"],
-                    y=sub_df["SubCategory"],
-                    orientation="h",
-                    marker_color="#80cbc4",
-                    text=sub_df["_label"],
-                    textposition="outside",
-                    hovertemplate="<b>%{y}</b><br>OMR %{x:,.0f}<extra></extra>",
-                ))
-                fig_sub.update_layout(
-                    xaxis_title="", yaxis_title="",
-                    xaxis=dict(showticklabels=False,
-                               range=[0, sub_df["Amount"].max() * 1.35]),
-                    margin=dict(t=10, b=0, r=10), height=320,
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_sub, width="stretch", config=CHART_CFG)
-
-        st.divider()
-
-        # ── Full transaction table for the cycle ───────────────────────────────
-        st.subheader(f"All Transactions — {cycle_label(sel_travel_cycle)}")
-
-        # Add sub-category column for travel rows
-        display_travel = cycle_all.copy()
-        display_travel["SubCategory"] = display_travel.apply(
-            lambda r: travel_subcat(r["Description"]) if r["Category"] == travel_cat else "—",
-            axis=1,
-        )
-        display_travel = display_travel[
-            ["Transaction Date", "Description", "City", "Country",
-             "Amount", "Category", "SubCategory"]
-        ].sort_values("Amount", ascending=False).copy()
-        display_travel["Amount"] = display_travel["Amount"].round(0).astype(int)
-        display_travel["Transaction Date"] = display_travel["Transaction Date"].dt.strftime("%d %b %Y")
-        display_travel = display_travel.rename(columns={"Amount": "OMR Amount"})
-        st.dataframe(display_travel, hide_index=True, width="stretch")
+    fig_fh = go.Figure()
+    fig_fh.add_hrect(y0=BAND_LO, y1=BAND_HI, fillcolor="#b0bec5", opacity=0.18,
+                     line_width=0, layer="below")
+    fig_fh.add_trace(go.Bar(
+        x=fh["Label"], y=fh["Amount"], name="Cycle total",
+        marker=dict(color=[BLUE if d else GREY for d in fh["Done"]],
+                    line=dict(color=["rgba(0,0,0,0)" if d else "#bdbdbd" for d in fh["Done"]],
+                              width=1.5)),
+        hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<extra></extra>"))
+    fig_fh.add_trace(go.Scatter(
+        x=fh["Label"], y=fh["R3"], mode="lines+markers", name="3-cycle avg",
+        line=dict(color="#e65100", width=2), marker=dict(size=5), connectgaps=False,
+        hovertemplate="3-cycle avg: OMR %{y:,.0f}<extra></extra>"))
+    fig_fh.update_layout(
+        xaxis_title="", yaxis_title="OMR", yaxis=dict(tickformat=",d"),
+        legend_title="", height=340, margin=dict(t=10, b=0))
+    st.plotly_chart(fig_fh, width="stretch", config=CHART_CFG)
+    st.caption("Shaded band is your normal range. Grey bars are partial cycles, "
+               "excluded from the band and the rolling average.")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TRANSACTIONS
+# SETUP — configuration, not analysis
 # ════════════════════════════════════════════════════════════════════════════════
-with t_txns:
-    search = st.text_input("Search merchant", placeholder="e.g. LULU SPAR  or  LULU, SPAR  (space or comma separates terms)")
-    show_flt = flt
-    if search:
-        # Split on commas or whitespace; match any term (OR logic)
-        terms = [t.strip().upper() for t in search.replace(",", " ").split() if t.strip()]
-        desc_upper = flt["Description"].str.upper()
-        mask = desc_upper.apply(lambda d: any(t in d for t in terms))
-        show_flt = flt[mask]
-
-    st.caption(f"{len(show_flt)} transaction(s)")
-
-    # Month-on-month chart when a search filter is active
-    if search and not show_flt.empty:
-        srch_monthly = (
-            show_flt.groupby("Month")["Amount"].sum().reset_index()
-        )
-        srch_monthly["Label"]   = srch_monthly["Month"].apply(cycle_label)
-        srch_monthly["AmtText"] = srch_monthly["Amount"].round(0).astype(int).apply(lambda v: f"OMR {v:,}")
-        srch_avg = srch_monthly["Amount"].mean()
-
-        fig_srch = go.Figure()
-        fig_srch.add_trace(go.Bar(
-            x=srch_monthly["Label"], y=srch_monthly["Amount"],
-            text=srch_monthly["AmtText"], textposition="outside",
-            marker_color="#90caf9",
-            hovertemplate="<b>%{x}</b><br>OMR %{y:,.0f}<extra></extra>",
-            name="Spend",
-        ))
-        fig_srch.add_hline(
-            y=srch_avg, line_dash="dot", line_color="#555", line_width=1.5,
-            annotation_text=f"Avg  OMR {srch_avg:,.0f}",
-            annotation_position="top left", annotation_font_color="#555",
-        )
-        fig_srch.update_layout(
-            title=f'Monthly spend — {" / ".join(terms)}',
-            xaxis_title="", yaxis_title="OMR",
-            yaxis=dict(tickformat=",d",
-                       range=[0, srch_monthly["Amount"].max() * 1.25]),
-            showlegend=False,
-            margin=dict(t=50, b=0), height=270,
-        )
-        st.plotly_chart(fig_srch, width="stretch", config=CHART_CFG)
-
-    show = show_flt[["Transaction Date", "Description", "City", "Country",
-                      "TXN Currency", "TXN Amount", "Amount", "Category"]].copy()
-    show["_key"] = row_key(show_flt).values
-    show = show.sort_values("Transaction Date", ascending=False).reset_index(drop=True)
-    show.insert(0, "Delete", False)
-    show["Amount"] = show["Amount"].round(0).astype(int)
-    show = show.rename(columns={"Amount": "OMR Amount"})
-    show["Transaction Date"] = show["Transaction Date"].dt.strftime("%d %b %Y")
-
-    edited = st.data_editor(
-        show.drop(columns=["_key"]),
-        column_config={
-            "Delete": st.column_config.CheckboxColumn(
-                "🗑️", help="Check rows to delete, then click Delete"
-            ),
-        },
-        disabled=[c for c in show.columns if c not in ["Delete", "_key"]],
-        hide_index=True,
-        width="stretch",
-        key="txn_editor",
-    )
-
-    n_sel = int(edited["Delete"].sum())
-    col_del, col_exp = st.columns([2, 5])
-
-    with col_del:
-        if st.button(
-            f"Delete {n_sel} transaction{'s' if n_sel != 1 else ''}",
-            type="primary",
-            disabled=(n_sel == 0),
-        ):
-            keys_to_remove = show.loc[edited["Delete"].values, "_key"].tolist()
-            delete_rows(keys_to_remove)
-            st.success(f"Deleted {n_sel} transaction(s).")
-            st.rerun()
-
-    with col_exp:
-        export = show.drop(columns=["_key", "Delete"])
-        st.download_button("Export CSV", export.to_csv(index=False), "expenses.csv", "text/csv")
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# RECLASSIFY
-# ════════════════════════════════════════════════════════════════════════════════
-with t_reclassify:
+with t_setup:
     st.caption(
         "Override the auto-classification for any merchant. "
         "Saved changes apply to all past and future transactions from that merchant."
