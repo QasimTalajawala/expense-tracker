@@ -8,9 +8,22 @@ __pycache__/
 # including to Streamlit Cloud.
 .streamlit/secrets.toml
 
-# Data files (personal financial data — keep out of git)
+# Personal financial data — keep out of git. This repo is public, so the rules
+# below are deliberately broad: any statement dropped into the project should be
+# ignored by default rather than relying on it having an expected filename.
+# demo_data.csv is the one exception and is force-added below.
 expense_tracker/expense_data.csv
 expense_tracker/category_overrides.json
+expense_tracker/commitments.json
+
+# Any raw statement, wherever it lands
+*.xls
+*.xlsx
+statements/
+*statement*.csv
+*statement*.pdf
+*_data.csv
+!expense_tracker/demo_data.csv
 
 # Backups (tracked by git instead)
 expense_tracker/app_backup_*.py
