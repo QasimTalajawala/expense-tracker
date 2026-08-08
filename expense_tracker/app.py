@@ -225,50 +225,6 @@ RULES = [
 # If total unclassified spend is BELOW this amount, suppress the warning banner.
 OTHERS_WARN_OMR = 150  # warn only if total unclassified spend exceeds this
 
-# Travel sub-category rules: (SubCategory, [keywords]) — priority-ordered, first match wins
-TRAVEL_SUBCATS = [
-    ("Hotels & Accommodation",  [# Chain brands
-                                  "MARRIOTT", "HILTON", "HYATT", "SHERATON", "RITZ CARLTON",
-                                  "IBIS", "NOVOTEL", "RADISSON", "HOLIDAY INN", "HIEX",
-                                  "FOUR POINTS", "ANANTARA", "ALILA", "DUSIT",
-                                  # Local / boutique
-                                  "LEVATIO", "SOLID HOTEL", "ALAKHDER", "ALAKHDAR",
-                                  "AL WADI DOHA", "MGALLERY",
-                                  # Generic
-                                  "HOTEL", "HOSTEL", "RESORT", "SUITES", "GUESTHOUSE",
-                                  # Booking platforms that book accommodation
-                                  "AIRBNB",
-                                  ]),
-    ("Flights & Rail",          [# Oman
-                                  "OMANAIR", "OMAN AIR", "SALAMAIR",
-                                  # Gulf / Middle East
-                                  "ETIHAD", "FLYDUBAI", "EMIRATES", "QATAR AIR",
-                                  "INDIGO AIR",
-                                  # European rail & coaches
-                                  "WESTBAHN", "REGIOJET", "DB AUTOMAT", "OEBB",
-                                  # Generic
-                                  "AIRLINE", "AIRWAYS", "AIRPORT BUS", "AIRPORTBUS",
-                                  "EUROSTAR", "FLIXBUS",
-                                  ]),
-    ("Online Booking",          [# Multi-modal / rail booking
-                                  "OMIO", "HOUSE OF TRAVEL",
-                                  # Accommodation platforms
-                                  "BOOKING.COM", "EXPEDIA", "AGODA", "HOTELS.COM",
-                                  "TRIVAGO", "KAYAK", "SKYSCANNER", "MAKEMYTRIP",
-                                  ]),
-    ("Taxis & Ride-hailing",    ["UBER", "CAREEM", "OTAXI", "DUBAI TAXI",
-                                  "TAXI", "LYFT", "BOLT.EU", "GRAB", "CAB"]),
-    ("Car Rental",              ["EUROPCAR", "HERTZ", "AVIS", "SIXT",
-                                  "CARS ON BOOKING", "CAR RENTAL", "RENT A CAR"]),
-    ("Public Transport",        ["WIENER LINIEN", "LOGMVV", "APLIKA",
-                                  "METRO", "SUBWAY", "TRAM", "OYSTER", "TFL",
-                                  "S-BAHN", "U-BAHN"]),
-    ("Airport & Parking",       ["MARHABA", "AIRPORT", "TERMINAL", "LOUNGE",
-                                  "DUTY FREE", "PARKING", "PARKPLATZ"]),
-    ("Travel Services",         ["GETNOMAD",        # travel eSIM / connectivity
-                                  "NOMAD", "ESIM"]),
-]
-
 # ── Merchant normalisation ────────────────────────────────────────────────────
 # Bank descriptions fragment the same merchant across many strings — petrol
 # stations carry site numbers, online merchants carry order refs, gateways add
@@ -411,15 +367,6 @@ def classify(desc: str) -> str:
         if any(kw in u for kw in keywords):
             return cat
     return "Others"
-
-
-def travel_subcat(desc: str) -> str:
-    """Sub-classify a Travel & Transport transaction into a finer bucket."""
-    u = desc.upper()
-    for subcat, keywords in TRAVEL_SUBCATS:
-        if any(kw in u for kw in keywords):
-            return subcat
-    return "Other Travel"
 
 
 def apply_overrides(df: pd.DataFrame, overrides: dict) -> pd.DataFrame:
@@ -624,6 +571,13 @@ REMOTE_BILLING = [
 ]
 
 
+# Values in the Country column that mean "not a trip": blanks, and home itself.
+# Bank Muscat writes the full country name, but some statements use ISO codes —
+# without "OMN" here, every domestic transaction reads as foreign and the whole
+# history comes back as a series of trips to Oman.
+NOT_FOREIGN = {"-NIL-", "NAN", "NONE", "", "OMAN", "OMN", "OM", "SULTANATE OF OMAN"}
+
+
 def _is_remote(desc: str) -> bool:
     u = str(desc).upper()
     return any(k in u for k in REMOTE_BILLING)
@@ -643,7 +597,7 @@ def detect_trips(df, gap_days=5, min_days=2) -> list:
     """
     f = df[
         df["Country"].notna()
-        & ~df["Country"].astype(str).str.upper().isin(["-NIL-", "NAN", "", "OMAN"])
+        & ~df["Country"].astype(str).str.strip().str.upper().isin(NOT_FOREIGN)
         & ~df["Description"].apply(_is_remote)
     ].sort_values("Transaction Date")
     if f.empty:
@@ -823,7 +777,6 @@ payments["Amount"] = payments["OMR Amount"]  # positive = payment received
 
 SERIES_1  = "#2a78d6"   # blue   — default single series
 SERIES_2  = "#eb6834"   # orange — second series only
-ACCENT    = "#256abf"   # darker blue for emphasis
 INK       = "#0b0b0b"
 INK_2     = "#52514e"
 MUTED     = "#898781"
@@ -964,14 +917,23 @@ def band_chart(totals_series, height=300, label_every=False):
     return fig
 
 
-t_over, t_cats, t_trends, t_txns, t_setup = st.tabs(
-    ["Overview", "Categories", "Trends", "Transactions", "⚙️ Setup"]
-)
+# Navigation is a segmented control driving conditional rendering, not st.tabs.
+# st.tabs builds every tab body on every rerun, which meant (a) all five views
+# were recomputed whenever any widget changed, and (b) tables and charts in the
+# inactive tabs were laid out at zero width and never re-measured when shown —
+# so they appeared collapsed until the window was resized. Rendering only the
+# selected view fixes both.
+VIEWS = ["Overview", "Categories", "Trends", "Transactions", "⚙️ Setup"]
+view = st.segmented_control("View", VIEWS, default=VIEWS[0],
+                            label_visibility="collapsed", key="nav")
+if view is None:                       # the control allows deselection
+    view = VIEWS[0]
+st.write("")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # OVERVIEW — where things stand, and what changed since last time
 # ════════════════════════════════════════════════════════════════════════════════
-with t_over:
+if view == "Overview":
     if not COMPLETE_CYCLES:
         st.warning("Need at least one complete billing cycle.")
     else:
@@ -991,8 +953,11 @@ with t_over:
 
         c1, c2, c3 = st.columns(3)
         with c1:
+            # Spell out the date range: a "cycle" runs 3rd-to-2nd, so "Jul 2026"
+            # is not the calendar month and that trips people up.
             stat_tile(f"Last complete cycle · {cycle_label(latest)}",
-                      f"OMR {latest_tot:,.0f}", verdict)
+                      f"OMR {latest_tot:,.0f}",
+                      f"{cycle_dates(latest)} · {verdict}")
         with c2:
             stat_tile("Typical cycle", f"OMR {TYPICAL:,.0f}",
                       f"normal range {BAND_LO:,.0f}–{BAND_HI:,.0f}",
@@ -1009,8 +974,12 @@ with t_over:
         st.subheader("Spend per cycle")
         st.plotly_chart(band_chart(cycle_totals, height=320),
                         width="stretch", config=CHART_CFG)
-        st.caption(f"Shaded band is your normal range, OMR {BAND_LO:,.0f}–{BAND_HI:,.0f}. "
-                   "Pale bars are partial cycles, excluded from the band.")
+        st.caption(
+            f"Shaded band is your normal range, OMR {BAND_LO:,.0f}–{BAND_HI:,.0f}."
+            # Only explain the pale bars when there actually are some.
+            + (" Pale bars are partial cycles, excluded from the band."
+               if PARTIAL_CYCLES else "")
+        )
 
         st.divider()
 
@@ -1063,7 +1032,7 @@ with t_over:
 # ════════════════════════════════════════════════════════════════════════════════
 # CATEGORIES — is each one rising, falling, or just noisy?
 # ════════════════════════════════════════════════════════════════════════════════
-with t_cats:
+if view == "Categories":
     if len(COMPLETE_CYCLES) < 2:
         st.warning("Need at least two complete billing cycles.")
     else:
@@ -1082,11 +1051,15 @@ with t_cats:
         # volatility AND is materially large. Travel swings by OMR 279 between
         # cycles, so a 50-OMR "rise" there is noise; in Fuel it would be real.
         st.subheader("Rising and falling")
-        half = max(1, len(period) // 2)
+        # Split at the midpoint so every cycle counts on one side or the other.
+        # Taking the last N and first N instead would silently drop the middle
+        # cycle whenever the period has an odd length.
+        mid    = max(1, len(period) // 2)
+        n_late, n_early = len(period) - mid, mid
         rows = []
         for c in order.index:
             s = grid[c]
-            now, before = s.iloc[-half:].mean(), s.iloc[:half].mean()
+            now, before = s.iloc[mid:].mean(), s.iloc[:mid].mean()
             noise, chg  = s.std(), now - before
             if noise and abs(chg) >= max(15, noise * 0.75):
                 trend = "▲ rising" if chg > 0 else "▼ falling"
@@ -1107,10 +1080,10 @@ with t_cats:
             column_config={
                 "OMR / cycle": st.column_config.NumberColumn(format="%.0f"),
                 "Recent": st.column_config.NumberColumn(
-                    f"Last {half}", format="%.0f",
-                    help=f"Average over the last {half} cycle(s) of the period"),
+                    f"Last {n_late}", format="%.0f",
+                    help=f"Average over the last {n_late} cycle(s) of the period"),
                 "Was": st.column_config.NumberColumn(
-                    f"First {half}", format="%.0f"),
+                    f"First {n_early}", format="%.0f"),
                 "Change": st.column_config.NumberColumn(format="%+.0f"),
                 "Share": st.column_config.ProgressColumn(
                     "Share of spend", format="%.0f%%", min_value=0,
@@ -1119,8 +1092,8 @@ with t_cats:
         )
         st.caption(
             f"“Steady” means the change is inside the category's own cycle-to-cycle "
-            f"swing — not that nothing moved. Comparing the last {half} cycle(s) "
-            f"against the first {half}."
+            f"swing — not that nothing moved. Comparing the last {n_late} cycle(s) "
+            f"against the first {n_early}."
         )
 
         st.divider()
@@ -1223,21 +1196,30 @@ with t_cats:
 # ════════════════════════════════════════════════════════════════════════════════
 # TRENDS — the overall shape, and what drives the swings
 # ════════════════════════════════════════════════════════════════════════════════
-with t_trends:
+if view == "Trends":
     if len(COMPLETE_CYCLES) < 3:
         st.warning("Need at least three complete billing cycles.")
     else:
         st.subheader("Everyday base vs episodic spend")
-        st.caption(
-            "Everyday is food, groceries, fuel and bills; episodic is travel and "
-            "large one-off purchases. Measured over your history, everyday runs at "
-            "roughly a third the volatility of episodic — so almost every swing in "
-            "your monthly total comes from the orange band."
-        )
         kd = (expenses[expenses["Month"].isin(COMPLETE_CYCLES)]
               .pivot_table(index="Month", columns="Kind", values="Amount",
                            aggfunc="sum").reindex(COMPLETE_CYCLES).fillna(0))
         klab = [cycle_label(m) for m in COMPLETE_CYCLES]
+
+        # Volatility is measured from the loaded data rather than asserted — the
+        # ratio depends on whose statement this is, so a hard-coded claim would
+        # be wrong for anyone else.
+        _cv = {k: (kd[k].std() / kd[k].mean()) if k in kd and kd[k].mean() else 0
+               for k in ("Everyday", "Episodic")}
+        _ratio = (_cv["Episodic"] / _cv["Everyday"]) if _cv["Everyday"] else 0
+        st.caption(
+            "Everyday is food, groceries, fuel and bills; episodic is travel and "
+            "large one-off purchases."
+            + (f" Across your {len(COMPLETE_CYCLES)} complete cycles the episodic "
+               f"half swings **{_ratio:.1f}× more** than the everyday base, so most "
+               f"of the movement in your monthly total is the orange band."
+               if _ratio > 1.1 else "")
+        )
 
         fig_k = go.Figure()
         for name, colr in (("Everyday", SERIES_1), ("Episodic", SERIES_2)):
@@ -1291,9 +1273,11 @@ with t_trends:
 
         # ── Trips: the usual explanation for an episodic spike ─────────────────
         st.subheader("Trips")
-        st.caption("Detected from clusters of foreign-currency spend that include a "
-                   "flight, hotel or taxi. Cost counts everything charged during the "
-                   "window, not just the Travel category.")
+        st.caption("Detected from clusters of spend at merchants abroad, on at least "
+                   "two separate days, including a flight, hotel or taxi. Online "
+                   "orders and subscriptions billed from overseas are ignored. Cost "
+                   "counts everything charged during the window, not just the Travel "
+                   "category.")
         trips = detect_trips(expenses)
         if not trips:
             st.info("No trips detected.")
@@ -1372,7 +1356,7 @@ with t_trends:
 # ════════════════════════════════════════════════════════════════════════════════
 # TRANSACTIONS
 # ════════════════════════════════════════════════════════════════════════════════
-with t_txns:
+if view == "Transactions":
     q = st.text_input("Search", placeholder="e.g. lulu spar — space or comma separates terms",
                       label_visibility="collapsed")
     found = expenses
@@ -1467,7 +1451,7 @@ with t_txns:
 # ════════════════════════════════════════════════════════════════════════════════
 # SETUP — configuration, not analysis
 # ════════════════════════════════════════════════════════════════════════════════
-with t_setup:
+if view == "⚙️ Setup":
     st.caption(
         "Override the auto-classification for any merchant. "
         "Saved changes apply to all past and future transactions from that merchant."
