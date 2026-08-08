@@ -129,6 +129,11 @@ RULES = [
                                 "ALAKHDER", "ALAKHDAR",
                                 # Hotel URLs that truncate before "SUITES"
                                 "DOWNTOWNSUI",    # https://www.downtownsuites...
+                                # "AL WADI DOHA GALLERY HDOH" = Al Wadi Hotel Doha
+                                # MGallery. HDOH is the hotel's own code; the name
+                                # carries no word this rule would otherwise catch,
+                                # so it had been sitting in Shopping & Retail.
+                                "AL WADI DOHA", "MGALLERY",
                                 ]),
 
     ("Entertainment",          ["MUSCAT FESTIVAL", "CINEMA", "VOX", "REEL", "THEME PARK",
@@ -155,7 +160,7 @@ RULES = [
 
     ("Shopping & Retail",      ["AMERICAN EAGLE", "PIERRE CARDIN", "H&M", "ZARA", "MARKS",
                                 "CENTREPOINT", "ADIDAS", "NIKE", "PLAY PHONE", "JUMBO",
-                                "AL WADI DOHA", "RANIM", "PROGRESS CITIES", "MUSCAT TOP",
+                                "RANIM", "PROGRESS CITIES", "MUSCAT TOP",
                                 "ALBAKRY", "JIBAL",
                                 "IKEA", "DECATHLON", "MATALAN", "SUN & SAND", "TEMU",
                                 "AMZN", "AMAZON", "EXTRA", "LAAM", "HYPERMAX", "MANGO",
@@ -228,6 +233,7 @@ TRAVEL_SUBCATS = [
                                   "FOUR POINTS", "ANANTARA", "ALILA", "DUSIT",
                                   # Local / boutique
                                   "LEVATIO", "SOLID HOTEL", "ALAKHDER", "ALAKHDAR",
+                                  "AL WADI DOHA", "MGALLERY",
                                   # Generic
                                   "HOTEL", "HOSTEL", "RESORT", "SUITES", "GUESTHOUSE",
                                   # Booking platforms that book accommodation
@@ -602,19 +608,43 @@ def typical_band(totals: pd.Series) -> tuple[float, float]:
     return float(totals.quantile(0.25)), float(totals.quantile(0.75))
 
 
-def detect_trips(df, gap_days=5, min_txns=3) -> list:
+# Merchants that bill from abroad while you sit at home: booking platforms,
+# e-commerce, and remote services. A foreign country on one of these says
+# nothing about where you were, so they must not seed or bridge a trip —
+# they were inventing a "UK trip" out of a British Council exam taken in
+# Muscat, and bridging the Europe trip to a later UAE one via Amazon.ca.
+REMOTE_BILLING = [
+    "MAKEMYTRIP", "BOOKING.COM", "AIRBNB", "EXPEDIA", "AGODA", "OMIO",
+    "HOTELS.COM", "TRIVAGO", "KAYAK", "SKYSCANNER", "CARS ON BOOKING",
+    "AMAZON", "AMZN", "TEMU", "IHERB", "NAMSHI", "LAAM", "MUMZWORLD",
+    "ALIEXPRESS", "EBAY", "NOON", "SHEIN",
+    "BRITISH COUNCIL", "VFS", "GETNOMAD", "NOMAD", "ESIM",
+    "ANTHROPIC", "CLAUDE", "NETFLIX", "SPOTIFY", "ADOBE", "MICROSOFT",
+    "CPAPMACHINES", "NAJAFYIA",
+]
+
+
+def _is_remote(desc: str) -> bool:
+    u = str(desc).upper()
+    return any(k in u for k in REMOTE_BILLING)
+
+
+def detect_trips(df, gap_days=5, min_days=2) -> list:
     """Group foreign-country spend into trips.
 
     A trip is the natural unit for episodic spend, and it cuts across
     categories — meals and shopping abroad belong to the trip, not to
-    Food & Dining.  Domestic-currency online purchases from foreign merchants
-    would create phantom trips, so only rows with a real merchant country and
-    a non-OMR currency count toward detection.
+    Food & Dining.
+
+    Detection uses merchant country, minus remote billers. An earlier version
+    required a non-OMR currency instead, which lost a real 3-day Qatar trip:
+    the hotel was billed in QAR but the cafe two days later was billed in OMR,
+    leaving only two qualifying rows on a single day.
     """
     f = df[
         df["Country"].notna()
         & ~df["Country"].astype(str).str.upper().isin(["-NIL-", "NAN", "", "OMAN"])
-        & (df["TXN Currency"] != "OMR")
+        & ~df["Description"].apply(_is_remote)
     ].sort_values("Transaction Date")
     if f.empty:
         return []
@@ -633,8 +663,15 @@ def detect_trips(df, gap_days=5, min_txns=3) -> list:
 
     out = []
     for t in trips:
-        if len(t["rows"]) < min_txns:
+        rows = pd.DataFrame(t["rows"])
+
+        # Being somewhere produces spend on more than one day; booking a hotel
+        # or flight from home produces a single day's charges. This is what
+        # separates the Qatar visit (hotel on the 18th, cafe on the 20th) from
+        # the Munich hotel booked from Oman six days before departure.
+        if rows["Transaction Date"].dt.date.nunique() < min_days:
             continue
+
         # Full cost = everything charged in the window, whatever its category
         window = df[(df["Transaction Date"] >= t["start"] - pd.Timedelta(days=1))
                     & (df["Transaction Date"] <= t["end"] + pd.Timedelta(days=1))]
@@ -648,7 +685,6 @@ def detect_trips(df, gap_days=5, min_txns=3) -> list:
 
         # Name only countries you actually spent time in. A single Amazon.ca
         # order placed mid-trip should not make Canada a destination.
-        rows  = pd.DataFrame(t["rows"])
         by_c  = rows.groupby("Country").agg(n=("Amount", "size"), amt=("Amount", "sum"))
         real  = by_c[by_c["n"] >= 2].sort_values("amt", ascending=False)
         if real.empty:
@@ -1474,9 +1510,16 @@ with t_setup:
     summary["Others"]   = summary["Merchant"].map(others_omr).fillna(0.0)
 
     # ── Others summary banner ──────────────────────────────────────────────────
-    others_summary = summary[summary["Others"] > 0]
-    total_others_omr = others_summary["Others"].sum()
-    n_others_merch   = len(others_summary)
+    # An explicit override to "Others" means the account holder looked at the
+    # merchant and concluded it cannot be identified — a wallet top-up, say,
+    # where the statement simply does not record what was bought. That is a
+    # settled answer, so it should not keep counting as an outstanding task.
+    parked = {merchant_name(d) for d, c in overrides.items() if c == "Others"}
+    unresolved = summary[(summary["Others"] > 0) & (~summary["Merchant"].isin(parked))]
+    parked_rows = summary[(summary["Others"] > 0) & (summary["Merchant"].isin(parked))]
+
+    total_others_omr = unresolved["Others"].sum()
+    n_others_merch   = len(unresolved)
     if n_others_merch > 0:
         if total_others_omr <= OTHERS_WARN_OMR:
             st.success(
@@ -1489,7 +1532,15 @@ with t_setup:
                 f"{n_others_merch} merchant(s) — consider classifying below."
             )
     else:
-        st.success("✅ All merchants classified — nothing in Others.")
+        st.success("✅ All merchants reviewed — nothing outstanding in Others.")
+
+    if not parked_rows.empty:
+        st.caption(
+            f"Plus OMR {parked_rows['Others'].sum():,.0f} across "
+            f"{len(parked_rows)} merchant(s) you've marked as unidentifiable "
+            f"({', '.join(parked_rows['Merchant'].head(4))}) — left in Others "
+            f"on purpose and not counted above."
+        )
 
     # ── Controls ───────────────────────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3 = st.columns([3, 3, 2])
