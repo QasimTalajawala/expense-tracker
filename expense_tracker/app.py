@@ -699,6 +699,30 @@ def detect_trips(df, gap_days=5, min_days=2) -> list:
     return sorted(out, key=lambda x: x["Start"], reverse=True)
 
 
+def like_for_like(df, cycles):
+    """Compare the two most recent years using only the months present in both.
+
+    Comparing whole years would punish whichever year has fewer cycles of data,
+    and comparing calendar years mid-way through one of them is worse still.
+    Restricting to matched months makes the two sides genuinely comparable and
+    strips out seasonality — a Ramadan or summer-travel month lands on both
+    sides or neither.
+    """
+    d = df[df["Month"].isin(cycles)].copy()
+    if d.empty:
+        return None
+    d["Y"], d["M"] = d["Month"].str[:4], d["Month"].str[5:]
+    years = sorted(d["Y"].unique())
+    if len(years) < 2:
+        return None
+    prev, curr = years[-2], years[-1]
+    months = sorted(set(d.loc[d["Y"] == prev, "M"]) & set(d.loc[d["Y"] == curr, "M"]))
+    if not months:
+        return None
+    lf = d[d["M"].isin(months) & d["Y"].isin([prev, curr])]
+    return {"prev": prev, "curr": curr, "months": months, "data": lf}
+
+
 def category_movers(df, cur_cycle, base_cycles, top_n=3) -> pd.DataFrame:
     """Categories that moved most vs the average of `base_cycles`.
 
@@ -1345,6 +1369,96 @@ if view == "Trends":
         fig_r.update_yaxes(tickformat=",d", title="OMR")
         st.plotly_chart(fig_r, width="stretch", config=CHART_CFG)
         st.caption("The shaded band is your normal range. Partial cycles are excluded.")
+
+        # ── Year on year, matched months only ──────────────────────────────────
+        lfl = like_for_like(expenses, COMPLETE_CYCLES)
+        if lfl:
+            st.divider()
+            mn = [pd.Timestamp(2000, int(m), 1).strftime("%b") for m in lfl["months"]]
+            st.subheader(f"{lfl['curr']} vs {lfl['prev']} — same months")
+            st.caption(
+                f"Comparing **{', '.join(mn)}** in both years — the {len(mn)} cycle(s) "
+                f"present in each. Restricting to matched months strips out "
+                f"seasonality and avoids penalising the year with less data."
+            )
+
+            lf   = lfl["data"]
+            tot  = lf.groupby("Y")["Amount"].sum()
+            prev_t, curr_t = float(tot[lfl["prev"]]), float(tot[lfl["curr"]])
+            delta_pct = (curr_t - prev_t) / prev_t * 100 if prev_t else 0
+
+            y1, y2, y3 = st.columns(3)
+            with y1:
+                stat_tile(f"{lfl['prev']} · {len(mn)} cycles", f"OMR {prev_t:,.0f}",
+                          f"OMR {prev_t/len(mn):,.0f} per cycle")
+            with y2:
+                stat_tile(f"{lfl['curr']} · {len(mn)} cycles", f"OMR {curr_t:,.0f}",
+                          f"OMR {curr_t/len(mn):,.0f} per cycle")
+            with y3:
+                stat_tile("Year on year", f"{delta_pct:+.0f}%",
+                          f"OMR {curr_t - prev_t:+,.0f} across the matched months")
+
+            p = lf.pivot_table(index="Category", columns="Y", values="Amount",
+                               aggfunc="sum").fillna(0)
+            p["Change"] = p[lfl["curr"]] - p[lfl["prev"]]
+            p = p.reindex(p["Change"].abs().sort_values().index)   # largest last = top
+
+            lcol, rcol = st.columns([3, 2])
+            with lcol:
+                # Diverging blue/orange: a warm/cool pair reads as opposite without
+                # implying good or bad, which red/green would.
+                fig_y = go.Figure(go.Bar(
+                    x=p["Change"], y=p.index, orientation="h",
+                    marker=dict(color=[SERIES_2 if v > 0 else SERIES_1 for v in p["Change"]],
+                                cornerradius=3),
+                    text=[f"{v:+,.0f}" for v in p["Change"]],
+                    textposition="outside", textfont=dict(color=INK_2, size=10),
+                    customdata=list(zip(p[lfl["prev"]], p[lfl["curr"]])),
+                    hovertemplate=("<b>%{y}</b><br>" + lfl["prev"] + ": OMR %{customdata[0]:,.0f}"
+                                   "<br>" + lfl["curr"] + ": OMR %{customdata[1]:,.0f}"
+                                   "<br>change: OMR %{x:+,.0f}<extra></extra>"),
+                ))
+                styled(fig_y, height=max(340, len(p) * 30), grid_y=False)
+                _m = max(abs(p["Change"].min()), abs(p["Change"].max())) * 1.35 or 1
+                fig_y.update_xaxes(showticklabels=False, showline=False, range=[-_m, _m],
+                                   zeroline=True, zerolinecolor=BASELINE, zerolinewidth=1)
+                st.plotly_chart(fig_y, width="stretch", config=CHART_CFG)
+                st.caption(f"Orange = more than {lfl['prev']}, blue = less.")
+
+            with rcol:
+                st.markdown("**Same merchant, same months**")
+                st.caption("Typical transaction size — a rough read on whether "
+                           "things simply cost more.")
+                rows = []
+                for m, d in lf.groupby("Merchant"):
+                    # Median, not mean: one annual charge among many small ones
+                    # drags a mean to nonsense. The gym billed OMR 68 once in
+                    # 2025 amid a dozen OMR 0.10 charges, which the mean read as
+                    # a 99% price cut when the typical charge never moved.
+                    a = d.groupby("Y")["Amount"].agg(["median", "size"])
+                    if len(a) < 2 or a["size"].min() < 4:
+                        continue          # too few to be meaningful
+                    was = float(a.loc[lfl["prev"], "median"])
+                    now = float(a.loc[lfl["curr"], "median"])
+                    if was <= 0:
+                        continue
+                    rows.append({"Merchant": m, "Was": round(was, 1),
+                                 "Now": round(now, 1),
+                                 "Change": (now - was) / was * 100})
+                if rows:
+                    md = pd.DataFrame(rows).reindex(
+                        pd.DataFrame(rows)["Change"].abs().sort_values(ascending=False).index)
+                    st.dataframe(
+                        md.head(10), hide_index=True, width="stretch",
+                        height=38 + min(len(md), 10) * 35,
+                        column_config={
+                            "Was": st.column_config.NumberColumn(f"{lfl['prev']}", format="%.1f"),
+                            "Now": st.column_config.NumberColumn(f"{lfl['curr']}", format="%.1f"),
+                            "Change": st.column_config.NumberColumn(format="%+.0f%%"),
+                        })
+                    st.caption("Merchants with at least 4 transactions in each year.")
+                else:
+                    st.info("Not enough repeat merchants across both years yet.")
 
         st.divider()
 
