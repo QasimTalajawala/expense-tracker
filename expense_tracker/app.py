@@ -1283,14 +1283,57 @@ if view == "Categories":
             st.plotly_chart(fig_mr, width="stretch", config=CHART_CFG)
             st.caption(f"Top merchants · {sdata['Merchant'].nunique()} in total")
 
-        det = sdata[["Transaction Date", "Merchant", "Amount", "Month"]].copy()
-        det["Date"]  = det["Transaction Date"].dt.strftime("%d %b %Y")
-        det["OMR"]   = det["Amount"].round(0).astype(int)
-        det["Cycle"] = det["Month"].apply(cycle_label)
-        st.dataframe(det[["Date", "Cycle", "Merchant", "OMR"]]
-                     .sort_values("OMR", ascending=False),
-                     hide_index=True, width="stretch", height=300)
-        st.caption(f"{len(sdata)} transaction(s) · OMR {sdata['Amount'].sum():,.0f}")
+        # Merchant against cycle, rather than a flat list of transactions sorted
+        # by size. A list of 280 rows answers no question; this grid answers two
+        # at once — read a row to see what drove a given cycle, read a column to
+        # see how one merchant has trended.
+        st.markdown("**Merchant by cycle**")
+        TOP_N = 8
+        piv = sdata.pivot_table(index="Month", columns="Merchant", values="Amount",
+                                aggfunc="sum").reindex(COMPLETE_CYCLES).fillna(0)
+        if piv.empty or not len(piv.columns):
+            st.info("No transactions in this category.")
+        else:
+            ranked = piv.sum().sort_values(ascending=False)
+            keep   = list(ranked.head(TOP_N).index)
+            table  = piv[keep].copy()
+            if len(ranked) > TOP_N:
+                table[f"Other ({len(ranked) - TOP_N})"] = piv[
+                    [c for c in piv.columns if c not in keep]].sum(axis=1)
+            table.insert(0, "Total", piv.sum(axis=1))
+            table.insert(0, "Cycle", [cycle_label(m) for m in table.index])
+            table = table.iloc[::-1].reset_index(drop=True)      # newest first
+
+            # Blank out zeros: an empty cell reads as "nothing here" far faster
+            # than a field of 0s, and the gaps make each merchant's run obvious.
+            # Formatted to text because st.dataframe renders a numeric blank —
+            # NaN or pd.NA alike — as the literal word "None". It reads the Arrow
+            # buffer directly, so neither NumberColumn(format=) nor a Styler
+            # na_rep reaches it.
+            num = list(table.columns.drop("Cycle"))
+            for c in num:
+                table[c] = [f"{v:,.0f}" if v else "" for v in table[c].round(0)]
+
+            st.dataframe(
+                table, hide_index=True, width="stretch",
+                height=min(38 + len(table) * 35, 430),
+            )
+            st.caption(
+                f"OMR per cycle · top {min(TOP_N, len(ranked))} of "
+                f"{len(ranked)} merchants shown"
+                + (f", the rest grouped as Other" if len(ranked) > TOP_N else "")
+                + ". Blank means no spend that cycle."
+            )
+
+        with st.expander(f"Every {sel} transaction "
+                         f"({len(sdata)} · OMR {sdata['Amount'].sum():,.0f})"):
+            det = sdata[["Transaction Date", "Merchant", "Amount", "Month"]].copy()
+            det["Date"]  = det["Transaction Date"].dt.strftime("%d %b %Y")
+            det["OMR"]   = det["Amount"].round(0).astype(int)
+            det["Cycle"] = det["Month"].apply(cycle_label)
+            st.dataframe(det[["Date", "Cycle", "Merchant", "OMR"]]
+                         .sort_values("OMR", ascending=False),
+                         hide_index=True, width="stretch", height=340)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
